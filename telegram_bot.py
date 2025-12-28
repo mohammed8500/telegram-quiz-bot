@@ -33,10 +33,8 @@ logging.basicConfig(
 logger = logging.getLogger("ProQuizBot")
 
 class Config:
-    # ضع التوكن هنا مباشرة إذا لم تستخدم Environment Variables
     TOKEN = os.getenv("BOT_TOKEN", "").strip()
     
-    # معرفات الأدمن (Admin IDs)
     ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
     if os.getenv("ADMIN_USER_ID"):
         if os.getenv("ADMIN_USER_ID").strip().isdigit():
@@ -54,12 +52,8 @@ class Config:
     BAR_WRONG = "🟥"
     BAR_EMPTY = "⬜"
 
-# التأكد من وجود التوكن
 if not Config.TOKEN:
-    # يمكنك وضع التوكن هنا كحل مؤقت للاختبار:
-    # Config.TOKEN = "YOUR_TOKEN_HERE"
-    if not Config.TOKEN:
-        raise RuntimeError("⚠️ BOT_TOKEN مفقود! تأكد من إعداد المتغيرات.")
+    raise RuntimeError("⚠️ BOT_TOKEN مفقود! تأكد من إعداد المتغيرات.")
 
 # =========================
 # 🗄️ إدارة قاعدة البيانات (Database)
@@ -176,7 +170,6 @@ class DatabaseManager:
                 ORDER BY total_points DESC, best_round_score DESC LIMIT {Config.TOP_N}
             """)]
 
-# تهيئة قاعدة البيانات
 db = DatabaseManager(Config.DB_FILE)
 
 # =========================
@@ -203,10 +196,7 @@ class QuestionManager:
             raw = data if isinstance(data, list) else data.get("items") or data.get("questions") or []
             
             for i, it in enumerate(raw):
-                # تصنيف عشوائي للفصول إذا لم يكن موجوداً (للاختبار)
                 it['_chapter'] = it.get('_chapter', random.choice(CHAPTERS))
-                
-                # إنشاء ID ثابت
                 base = str(it.get('question') or it.get('term') or i)
                 it['id'] = f"q_{abs(hash(base))}"
                 
@@ -225,26 +215,22 @@ class QuestionManager:
         chosen = []
         seen_ids = set()
         
-        # 1. محاولة جلب أسئلة جديدة من كل فصل
         for chap in CHAPTERS:
             pool = [q for q in self.buckets[chap] if not db.has_seen(user_id, q['id'])]
             random.shuffle(pool)
-            take = pool[:4] # 4 أسئلة من كل فصل = 20
+            take = pool[:4]
             chosen.extend(take)
             for q in take: seen_ids.add(q['id'])
 
-        # 2. إذا لم يكف العدد، نملأ من أي أسئلة أخرى
         if len(chosen) < Config.ROUND_SIZE:
             all_pool = [q for q in self.items if q['id'] not in seen_ids]
             random.shuffle(all_pool)
             needed = Config.ROUND_SIZE - len(chosen)
             chosen.extend(all_pool[:needed])
         
-        # 3. إذا ما زال ناقصاً (نادر جداً)، نكرر الأسئلة
-        if len(chosen) < Config.ROUND_SIZE:
+        if len(chosen) < Config.ROUND_SIZE and self.items:
              remaining = Config.ROUND_SIZE - len(chosen)
-             if self.items:
-                 chosen.extend(random.choices(self.items, k=remaining))
+             chosen.extend(random.choices(self.items, k=remaining))
 
         random.shuffle(chosen)
         return chosen[:Config.ROUND_SIZE]
@@ -255,7 +241,6 @@ qm = QuestionManager()
 # 🎮 جلسة اللعب (Game Session)
 # =========================
 class GameSession:
-    """يدير حالة الجولة للمستخدم الواحد"""
     def __init__(self, user_id, questions):
         self.user_id = user_id
         self.questions = questions
@@ -264,10 +249,8 @@ class GameSession:
         self.bonus = 0
         self.correct_count = 0
         self.streak = 0
-        self.history = [] # لتسجيل صح/خطأ للشريط
-        self.used_lifeline_5050 = False
-        
-        self.current_term_correct = "" # لتخزين الإجابة الصحيحة لأسئلة المصطلحات
+        self.history = []
+        self.current_term_correct = ""
 
     @property
     def current_q(self):
@@ -278,15 +261,12 @@ class GameSession:
         return self.current_idx >= len(self.questions)
 
     def get_progress_bar(self):
-        # 🟩🟩🟥⬜⬜
         bar = ""
         for res in self.history:
             bar += Config.BAR_CORRECT if res else Config.BAR_WRONG
-        
         remaining = len(self.questions) - len(self.history)
         bar += Config.BAR_EMPTY * remaining
         
-        # ضغط الشريط إذا كان طويلاً للجوال
         if len(self.questions) > 15 and len(bar) > 10:
              return f"✅ {self.correct_count} | ❌ {len(self.history)-self.correct_count} | ⏳ {remaining}"
         return bar
@@ -300,20 +280,18 @@ class GameSession:
             is_correct = (answer_data == str(q.get('correct', '')).upper())
         elif q_type == 'tf':
             ans_bool = (answer_data == 'true')
-            # الافتراض أن الإجابة في ملف JSON قد تكون boolean أو نص
             truth_raw = q.get('answer', q.get('correct'))
             truth = str(truth_raw).lower() in ['true', '1', 'yes', 'صح']
             is_correct = (ans_bool == truth)
         elif q_type == 'term':
             is_correct = (answer_data == self.current_term_correct)
 
-        # تحديث الإحصائيات
         self.history.append(is_correct)
         if is_correct:
             self.score += 1
             self.correct_count += 1
             self.streak += 1
-            if self.streak % Config.STREAK_BONUS_EVERY == 0:
+            if self.streak > 0 and self.streak % Config.STREAK_BONUS_EVERY == 0:
                 self.bonus += 1
             db.mark_seen(self.user_id, q.get('id'))
         else:
@@ -329,13 +307,12 @@ class GameSession:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.upsert_user(user.id)
-    
     text = (
         f"👋 **أهلاً بك يا {user.first_name}**\n\n"
         "🧠 **تحدي العباقرة**\n"
-        "• 20 سؤال متنوع (اختيار، صح/خطأ، مصطلحات)\n"
-        "• نظام بونص للإجابات المتتالية 🔥\n"
-        "• لوحة متصدرين للأقوياء فقط 🏆\n\n"
+        "• 20 سؤال متنوع\n"
+        "• احتفالات خاصة بالمتفوقين 🎉\n"
+        "• الأسئلة لا تختفي، تقدر تراجع إجاباتك!\n\n"
         "👇 اختر من القائمة لبدء التحدي!"
     )
     await update.message.reply_markdown(text, reply_markup=main_menu_kb(user.id))
@@ -343,7 +320,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main_menu_kb(user_id):
     user_data = db.get_user(user_id)
     status = "✅ معتمد" if user_data.get('is_approved') else "⚠️ غير معتمد"
-    
     kb = [
         [InlineKeyboardButton("🎮 ابدأ التحدي", callback_data="game_start")],
         [InlineKeyboardButton("🏆 المتصدرين", callback_data="menu_leaderboard"), 
@@ -362,12 +338,13 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = db.get_leaderboard()
         txt = "🏆 **لوحة الأبطال (TOP 10)**\n\n"
         if not rows:
-            txt += "لسه ما فيه أبطال 🌚 شد حيلك وكن الأول!"
+            txt += "لسه ما فيه أبطال 🌚"
         else:
             for i, r in enumerate(rows, 1):
                 txt += f"**#{i}** {r['full_name']} ➖ ⭐️ {r['total_points']}\n"
-        
-        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_back")]]), parse_mode="Markdown")
+        try:
+            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_back")]]), parse_mode="Markdown")
+        except: pass
 
     elif data == "menu_stats":
         u = db.get_user(user_id)
@@ -375,30 +352,32 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 **ملفك الشخصي**\n\n"
             f"👤 الاسم: {u.get('full_name', 'غير مسجل')}\n"
             f"⭐️ مجموع النقاط: {u.get('total_points')}\n"
-            f"🎯 لعبت: {u.get('rounds_played')} جولة\n"
-            f"🔥 أفضل سكور: {u.get('best_round_score')}"
+            f"🎯 لعبت: {u.get('rounds_played')} جولة"
         )
-        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_back")]]), parse_mode="Markdown")
+        try:
+            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_back")]]), parse_mode="Markdown")
+        except: pass
 
     elif data == "menu_name":
         context.user_data['awaiting_name'] = True
         await query.message.reply_text("✍️ **اكتب اسمك الثلاثي بالعربي الآن:**\n(مثال: محمد عبدالله سعود)", reply_markup=ReplyKeyboardRemove())
 
     elif data == "menu_back":
-        await query.edit_message_text("القائمة الرئيسية:", reply_markup=main_menu_kb(user_id))
+        try:
+            await query.edit_message_text("القائمة الرئيسية:", reply_markup=main_menu_kb(user_id))
+        except: pass
 
-
-# --- دالة عرض السؤال (Rendering) ---
-async def render_question(message, session: GameSession, is_edit=True):
+# --- دالة عرض السؤال (إرسال رسالة جديدة دائماً) ---
+async def send_new_question(bot, chat_id, session: GameSession):
     if session.is_finished:
-        await finish_game(message, session)
+        await finish_game_msg(bot, chat_id, session)
         return
 
     q = session.current_q
     idx = session.current_idx + 1
     total = len(session.questions)
     
-    # رأس السؤال مع شريط التقدم
+    # 📜 بناء نص السؤال
     text = f"**السؤال {idx}/{total}** | {q.get('_chapter', 'عام')}\n"
     text += f"{session.get_progress_bar()}\n\n"
     
@@ -407,8 +386,6 @@ async def render_question(message, session: GameSession, is_edit=True):
     if q['type'] == 'mcq':
         text += f"❓ **{q['question']}**"
         opts = q.get('options', {})
-        # ترتيب الخيارات عشوائياً أو ثابت حسب الرغبة (هنا ثابت لسهولة المطابقة)
-        # إذا كنت تريد خلط الأزرار، تأكد من مطابقة الكيز (A,B,C,D)
         for k in ['A', 'B', 'C', 'D']:
             if k in opts:
                 kb.append([InlineKeyboardButton(opts[k], callback_data=f"ans:{k}")])
@@ -422,115 +399,96 @@ async def render_question(message, session: GameSession, is_edit=True):
     elif q['type'] == 'term':
         text += f"📖 **{q['definition']}**\n\nما هو المصطلح المناسب؟"
         correct = q['term']
-        # توليد مشتتات
         pool = [t for t in qm.term_pool if t != correct]
         distractors = random.sample(pool, 3) if len(pool) >=3 else pool
         opts = distractors + [correct]
         random.shuffle(opts)
-        
-        # تعيين الأحرف للخيارات
         for i, opt in enumerate(opts):
             letter = chr(65+i) # A, B, C, D
             kb.append([InlineKeyboardButton(opt, callback_data=f"ans:{letter}")])
             if opt == correct:
-                session.current_term_correct = letter # حفظ الحرف الصحيح لهذه الجولة
-        
-    # زر المساعدة والحذف
-    if not session.used_lifeline_5050 and q['type'] in ['mcq', 'term']:
-        kb.append([InlineKeyboardButton("✂️ حذف إجابتين (50:50)", callback_data="lifeline:5050")])
+                session.current_term_correct = letter
     
     kb.append([InlineKeyboardButton("❌ انسحاب", callback_data="game_quit")])
     
-    markup = InlineKeyboardMarkup(kb)
-    
-    if is_edit:
-        await message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
-    else:
-        await message.reply_markdown(text, reply_markup=markup)
-
+    # إرسال رسالة جديدة (لا تعديل)
+    await bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     user_id = query.from_user.id
+    chat_id = query.message.chat_id
     
-    # 🟢 1. معالجة زر البدء (هنا الحل لمشكلة "انتهت الجلسة")
+    # 🟢 1. بدء اللعبة
     if data == "game_start":
         questions = qm.get_round_questions(user_id)
         if not questions:
-            await query.answer("⚠️ لا توجد أسئلة كافية في الملف!", show_alert=True)
+            await query.answer("⚠️ لا توجد أسئلة كافية!", show_alert=True)
             return
             
         session = GameSession(user_id, questions)
         context.user_data['session'] = session
-        await render_question(query.message, session)
+        await send_new_question(context.bot, chat_id, session)
         return
 
-    # 🟢 2. التأكد من وجود جلسة لباقي الأزرار
+    # 🟢 2. التأكد من الجلسة
     session: GameSession = context.user_data.get('session')
     if not session:
         try:
-            await query.edit_message_text("⚠️ انتهت الجلسة. اضغط /start للبدء من جديد.")
-        except:
-            pass
+            await context.bot.send_message(chat_id, "⚠️ انتهت الجلسة. اضغط /start من جديد.")
+        except: pass
         return
 
-    # 🟢 3. معالجة الانسحاب
+    # 🟢 3. الانسحاب
     if data == "game_quit":
-        await finish_game(query.message, session, surrendered=True)
+        await finish_game_msg(context.bot, chat_id, session, surrendered=True)
         context.user_data.pop('session', None)
         return
 
-    # 🟢 4. معالجة وسيلة المساعدة
-    if data == "lifeline:5050":
-        if session.used_lifeline_5050:
-            await query.answer("سبق واستخدمت المساعدة!", show_alert=True)
-            return
-        session.used_lifeline_5050 = True
-        await query.answer("✂️ تم حذف إجابتين خطأ! (ركز الحين)", show_alert=True)
-        # هنا نعيد رسم السؤال، (في نسخة متقدمة يمكننا حذف الأزرار فعلياً، هنا نكتفي بالتنبيه)
-        await render_question(query.message, session)
-        return
-
-    # 🟢 5. معالجة الإجابات
+    # 🟢 4. معالجة الإجابة
     if data.startswith("ans:"):
         ans_val = data.split(":")[1]
+        
+        # حفظ النص القديم قبل التعديل
+        original_text = query.message.text_markdown
+        
+        # التحقق من الإجابة
         is_correct = session.check_answer(ans_val)
         
-        # تأثير بصري فوري (تغيير الأيقونة)
-        current_kb = query.message.reply_markup
-        new_rows = []
+        # تحديد أيقونة النتيجة
+        result_icon = "✅ إجابة صحيحة!" if is_correct else "❌ إجابة خاطئة!"
         
-        for row in current_kb.inline_keyboard:
-            new_row = []
-            for btn in row:
-                if btn.callback_data == data:
-                    icon = "✅" if is_correct else "❌"
-                    # جعل الزر غير نشط
-                    new_btn = InlineKeyboardButton(f"{icon} {btn.text}", callback_data="ignore")
-                else:
-                    new_btn = btn
-                new_row.append(new_btn)
-            new_rows.append(new_row)
-        
+        # 🔒 قفل السؤال السابق: تعديل الرسالة القديمة لإزالة الأزرار وإظهار النتيجة
         try:
-            await query.edit_message_reply_markup(InlineKeyboardMarkup(new_rows))
-        except:
-            pass # لتجنب الأخطاء في الضغط السريع
-        
-        # انتظار بسيط
-        await asyncio.sleep(0.8) 
-        
-        # السؤال التالي
-        await render_question(query.message, session)
+            final_text = f"{original_text}\n\n{result_icon}"
+            await query.edit_message_text(text=final_text, reply_markup=None, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Failed to edit message: {e}")
 
-async def finish_game(message, session: GameSession, surrendered=False):
+        # 🎉 احتفال متحرك كل 3 إجابات صحيحة
+        if is_correct and session.streak > 0 and session.streak % 3 == 0:
+            celebration_msg = await context.bot.send_message(
+                chat_id, 
+                "🎉🎉 **مـاشـاء الـلـه!** 🎉🎉\n🔥🔥 **3 إجابات صحيحة متتالية!** 🔥🔥\n🚀 استمر يا بطل!",
+                parse_mode="Markdown"
+            )
+            await asyncio.sleep(2.5) # بقاء الاحتفال قليلاً
+            # اختياري: حذف رسالة الاحتفال لترتيب الشات (أو تركها)
+            # await celebration_msg.delete() 
+
+        # ⏳ تأخير بسيط جداً
+        await asyncio.sleep(0.5) 
+        
+        # 📤 إرسال السؤال التالي (رسالة جديدة)
+        await send_new_question(context.bot, chat_id, session)
+
+async def finish_game_msg(bot, chat_id, session: GameSession, surrendered=False):
     db.save_round(session.user_id, session.score, session.bonus, session.correct_count, len(session.questions))
     
     total_score = session.score + session.bonus
     pct = int((session.correct_count / len(session.questions)) * 100) if session.questions else 0
-    
     grade = "👑 أسطورة!" if pct >= 90 else "🔥 ممتاز" if pct >= 70 else "😅 حاول مرة ثانية"
     
     txt = (
@@ -542,22 +500,19 @@ async def finish_game(message, session: GameSession, surrendered=False):
         f"{session.get_progress_bar()}"
     )
     
-    # العودة للقائمة
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu_back")]])
-    await message.edit_text(txt, reply_markup=kb, parse_mode="Markdown")
+    await bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb, parse_mode="Markdown")
 
 # =========================
 # 📝 معالجة النصوص (إدخال الأسماء)
 # =========================
 async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('awaiting_name'): return
-    
     name = update.message.text.strip()
     user_id = update.effective_user.id
     
-    # تحقق بسيط من الاسم
     if len(name.split()) < 2 or not re.match(r'^[\u0600-\u06FF\s]+$', name):
-        await update.message.reply_text("❌ الاسم يجب أن يكون بالعربي وثنائي على الأقل (بدون أرقام أو رموز).")
+        await update.message.reply_text("❌ الاسم يجب أن يكون بالعربي وثنائي على الأقل.")
         return
         
     db.set_pending_name(user_id, name)
@@ -565,16 +520,14 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("✅ تم إرسال اسمك للمراجعة.", reply_markup=main_menu_kb(user_id))
     
-    # إشعار الأدمن
     for adm in Config.ADMIN_IDS:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ قبول", callback_data=f"adm_ok:{user_id}"), 
              InlineKeyboardButton("❌ رفض", callback_data=f"adm_no:{user_id}")]
         ])
         try:
-            await context.bot.send_message(adm, f"📝 **طلب اعتماد اسم جديد**\n👤: {name}\n🆔: `{user_id}`", parse_mode="Markdown", reply_markup=kb)
-        except Exception as e:
-            logger.warning(f"تعذر إرسال رسالة للأدمن {adm}: {e}")
+            await context.bot.send_message(adm, f"📝 **طلب اعتماد اسم**\n👤: {name}\n🆔: `{user_id}`", parse_mode="Markdown", reply_markup=kb)
+        except: pass
 
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -589,37 +542,25 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "adm_ok":
         name = db.approve_user(target_id)
         await query.edit_message_text(f"✅ تم اعتماد: {name}")
-        try: await context.bot.send_message(target_id, f"🎉 مبروك! تم اعتماد اسمك ({name})، الآن ستظهر في لوحة المتصدرين.")
+        try: await context.bot.send_message(target_id, f"🎉 مبروك! تم اعتماد اسمك ({name})!")
         except: pass
         
     elif action == "adm_no":
         db.reject_user(target_id)
         await query.edit_message_text(f"❌ تم رفض الطلب.")
-        try: await context.bot.send_message(target_id, "❌ تم رفض الاسم. الرجاء كتابة اسمك الثلاثي الصريح.")
+        try: await context.bot.send_message(target_id, "❌ تم رفض الاسم.")
         except: pass
 
 # =========================
 # 🚀 التشغيل الرئيسي
 # =========================
 def main():
-    # بناء التطبيق
     app = Application.builder().token(Config.TOKEN).build()
     
-    # إضافة المعالجات (Handlers)
-    # الترتيب مهم: Specific patterns أولاً
     app.add_handler(CommandHandler("start", start))
-    
-    # معالج القوائم
     app.add_handler(CallbackQueryHandler(menu_handler, pattern="^menu_"))
-    
-    # معالج الأدمن
     app.add_handler(CallbackQueryHandler(admin_handler, pattern="^adm_"))
-    
-    # معالج اللعبة (بدء، إجابة، انسحاب، مساعدة)
-    # ملاحظة: تم إضافة game_start هنا ليتم التقاطه بواسطة game_handler
-    app.add_handler(CallbackQueryHandler(game_handler, pattern="^(game_|ans:|lifeline:)"))
-    
-    # معالج النصوص (للأسماء)
+    app.add_handler(CallbackQueryHandler(game_handler, pattern="^(game_|ans:)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
     
     print(f"🤖 Bot started... (Admins: {Config.ADMIN_IDS})")

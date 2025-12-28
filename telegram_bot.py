@@ -146,7 +146,7 @@ async def maintenance_block(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if is_admin(user_id):
         return False
 
-    msg = "🛠️ البوت تحت صيانة حالياً… رجّعوا بعدين 🌿"
+    msg = "🛠️ البوت تحت صيانة حالياً… ارجعوا بعدين 🌿"
     # نزيل أي ReplyKeyboard قديم
     if update.message:
         await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())

@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 
 # =========================
-# ⚙️ إعدادات البوت (Config)
+# ⚙️ إعدادات البوت
 # =========================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -56,7 +56,7 @@ if not Config.TOKEN:
     raise RuntimeError("⚠️ BOT_TOKEN مفقود! تأكد من إعداد المتغيرات.")
 
 # =========================
-# 🗄️ إدارة قاعدة البيانات (Database)
+# 🗄️ إدارة قاعدة البيانات
 # =========================
 class DatabaseManager:
     def __init__(self, db_path):
@@ -173,7 +173,7 @@ class DatabaseManager:
 db = DatabaseManager(Config.DB_FILE)
 
 # =========================
-# 🧠 منطق الأسئلة (Logic)
+# 🧠 منطق الأسئلة
 # =========================
 CHAPTERS = ["طبيعة العلم", "المخاليط والمحاليل", "حالات المادة", "الطاقة وتحولاتها", "أجهزة الجسم"]
 
@@ -187,7 +187,7 @@ class QuestionManager:
     def _load(self):
         try:
             if not os.path.exists(Config.QUESTIONS_FILE):
-                logger.warning("ملف الأسئلة غير موجود، سيتم استخدام قائمة فارغة.")
+                logger.warning("ملف الأسئلة غير موجود.")
                 return
 
             with open(Config.QUESTIONS_FILE, 'r', encoding='utf-8') as f:
@@ -238,7 +238,7 @@ class QuestionManager:
 qm = QuestionManager()
 
 # =========================
-# 🎮 جلسة اللعب (Game Session)
+# 🎮 جلسة اللعب (Session)
 # =========================
 class GameSession:
     def __init__(self, user_id, questions):
@@ -250,7 +250,8 @@ class GameSession:
         self.correct_count = 0
         self.streak = 0
         self.history = []
-        self.current_term_correct = ""
+        self.current_term_correct = "" # تخزين الحرف الصحيح
+        self.current_term_text_map = {} # تخزين النصوص المقابلة للأحرف
 
     @property
     def current_q(self):
@@ -300,6 +301,28 @@ class GameSession:
         self.current_idx += 1
         return is_correct
 
+    def get_correct_text(self):
+        """إرجاع النص الصحيح للسؤال الحالي لعرضه للمستخدم"""
+        q = self.current_q
+        if not q: return ""
+        q_type = q.get('type')
+
+        if q_type == 'mcq':
+            correct_key = str(q.get('correct', '')).upper()
+            opts = q.get('options', {})
+            return opts.get(correct_key, correct_key) # يرجع نص الخيار
+        
+        elif q_type == 'tf':
+            truth_raw = q.get('answer', q.get('correct'))
+            truth = str(truth_raw).lower() in ['true', '1', 'yes', 'صح']
+            return "صح" if truth else "خطأ"
+            
+        elif q_type == 'term':
+            # نستخدم الـ map الذي خزنناه وقت العرض
+            return self.current_term_text_map.get(self.current_term_correct, q.get('term'))
+            
+        return ""
+
 # =========================
 # 🖥️ واجهة المستخدم (Handlers)
 # =========================
@@ -311,8 +334,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 **أهلاً بك يا {user.first_name}**\n\n"
         "🧠 **تحدي العباقرة**\n"
         "• 20 سؤال متنوع\n"
-        "• احتفالات خاصة بالمتفوقين 🎉\n"
-        "• الأسئلة لا تختفي، تقدر تراجع إجاباتك!\n\n"
+        "• احتفالات متحركة للمتفوقين 🎉\n"
+        "• واجهة عصرية وسهلة\n\n"
         "👇 اختر من القائمة لبدء التحدي!"
     )
     await update.message.reply_markdown(text, reply_markup=main_menu_kb(user.id))
@@ -367,7 +390,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("القائمة الرئيسية:", reply_markup=main_menu_kb(user_id))
         except: pass
 
-# --- دالة عرض السؤال (إرسال رسالة جديدة دائماً) ---
+# --- دالة عرض السؤال (مع إخفاء اسم الفصل) ---
 async def send_new_question(bot, chat_id, session: GameSession):
     if session.is_finished:
         await finish_game_msg(bot, chat_id, session)
@@ -377,8 +400,8 @@ async def send_new_question(bot, chat_id, session: GameSession):
     idx = session.current_idx + 1
     total = len(session.questions)
     
-    # 📜 بناء نص السؤال
-    text = f"**السؤال {idx}/{total}** | {q.get('_chapter', 'عام')}\n"
+    # تم إخفاء اسم الفصل من هنا حسب الطلب
+    text = f"**السؤال {idx}/{total}**\n"
     text += f"{session.get_progress_bar()}\n\n"
     
     kb = []
@@ -403,15 +426,17 @@ async def send_new_question(bot, chat_id, session: GameSession):
         distractors = random.sample(pool, 3) if len(pool) >=3 else pool
         opts = distractors + [correct]
         random.shuffle(opts)
+        
+        session.current_term_text_map = {} # تصفير وتعبئة
         for i, opt in enumerate(opts):
             letter = chr(65+i) # A, B, C, D
+            session.current_term_text_map[letter] = opt # حفظ الرابط بين الحرف والنص
             kb.append([InlineKeyboardButton(opt, callback_data=f"ans:{letter}")])
             if opt == correct:
                 session.current_term_correct = letter
     
     kb.append([InlineKeyboardButton("❌ انسحاب", callback_data="game_quit")])
     
-    # إرسال رسالة جديدة (لا تعديل)
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -427,7 +452,6 @@ async def game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not questions:
             await query.answer("⚠️ لا توجد أسئلة كافية!", show_alert=True)
             return
-            
         session = GameSession(user_id, questions)
         context.user_data['session'] = session
         await send_new_question(context.bot, chat_id, session)
@@ -436,8 +460,7 @@ async def game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🟢 2. التأكد من الجلسة
     session: GameSession = context.user_data.get('session')
     if not session:
-        try:
-            await context.bot.send_message(chat_id, "⚠️ انتهت الجلسة. اضغط /start من جديد.")
+        try: await context.bot.send_message(chat_id, "⚠️ انتهت الجلسة. اضغط /start من جديد.")
         except: pass
         return
 
@@ -447,41 +470,45 @@ async def game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('session', None)
         return
 
-    # 🟢 4. معالجة الإجابة
+    # 🟢 4. معالجة الإجابة وتعديل السؤال القديم
     if data.startswith("ans:"):
         ans_val = data.split(":")[1]
         
-        # حفظ النص القديم قبل التعديل
+        # حفظ بيانات السؤال الحالي قبل التحديث للحصول على النص
+        correct_text = session.get_correct_text()
         original_text = query.message.text_markdown
         
-        # التحقق من الإجابة
+        # التحقق وتحديث السكور
         is_correct = session.check_answer(ans_val)
         
-        # تحديد أيقونة النتيجة
-        result_icon = "✅ إجابة صحيحة!" if is_correct else "❌ إجابة خاطئة!"
+        # بناء نص النتيجة
+        if is_correct:
+            result_msg = f"✅ **إجابة صحيحة!**\nالجواب: {correct_text}"
+        else:
+            result_msg = f"❌ **إجابة خاطئة!**\nالصحيح هو: {correct_text}"
         
-        # 🔒 قفل السؤال السابق: تعديل الرسالة القديمة لإزالة الأزرار وإظهار النتيجة
+        # 🔒 تعديل الرسالة القديمة (قفل السؤال)
         try:
-            final_text = f"{original_text}\n\n{result_icon}"
+            final_text = f"{original_text}\n\n───────────────\n{result_msg}"
             await query.edit_message_text(text=final_text, reply_markup=None, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Failed to edit message: {e}")
+            logger.warning(f"Edit error: {e}")
 
-        # 🎉 احتفال متحرك كل 3 إجابات صحيحة
+        # 🎉 احتفال متحرك كل 3 إجابات (يظهر ويختفي)
         if is_correct and session.streak > 0 and session.streak % 3 == 0:
-            celebration_msg = await context.bot.send_message(
-                chat_id, 
-                "🎉🎉 **مـاشـاء الـلـه!** 🎉🎉\n🔥🔥 **3 إجابات صحيحة متتالية!** 🔥🔥\n🚀 استمر يا بطل!",
-                parse_mode="Markdown"
-            )
-            await asyncio.sleep(2.5) # بقاء الاحتفال قليلاً
-            # اختياري: حذف رسالة الاحتفال لترتيب الشات (أو تركها)
-            # await celebration_msg.delete() 
+            try:
+                # نرسل ستيكر ألعاب نارية (متحرك)
+                # ملاحظة: نستخدم هذا الـ ID الخاص بتليجرام للألعاب النارية أو نرسل Emoji متحرك
+                msg = await context.bot.send_message(chat_id, "🎆")
+                await asyncio.sleep(2.5) # ننتظر قليلاً
+                await msg.delete() # نحذف الرسالة (اختفاء)
+            except Exception:
+                pass 
 
-        # ⏳ تأخير بسيط جداً
+        # ⏳ تأخير بسيط لقراءة النتيجة
         await asyncio.sleep(0.5) 
         
-        # 📤 إرسال السؤال التالي (رسالة جديدة)
+        # 📤 إرسال السؤال التالي
         await send_new_question(context.bot, chat_id, session)
 
 async def finish_game_msg(bot, chat_id, session: GameSession, surrendered=False):

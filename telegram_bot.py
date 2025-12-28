@@ -550,7 +550,7 @@ def main():
 
     db_connect().close()
 
-    app = Application.builder().token(TOKEN).build()
+app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("stats", stats))

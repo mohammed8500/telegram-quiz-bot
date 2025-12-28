@@ -1060,7 +1060,10 @@ def main():
 
     # Callbacks (ترتيب مهم)
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
-    app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^(ans_mcq:|ans_tf:|ans_term:|end_round)$"))
+    app.add_handler(CallbackQueryHandler(
+    answer_callback,
+    pattern=r"^(ans_mcq:[ABCD]|ans_tf:(true|false)|ans_term:[ABCD]|end_round)$"
+))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(play_round|leaderboard|my_stats|set_name)$"))
 
     # Text messages (اسم فقط)

@@ -35,11 +35,18 @@ logger = logging.getLogger("ProQuizBot")
 class Config:
     TOKEN = os.getenv("BOT_TOKEN", "").strip()
     
+    # 🚨 ضع رقم الآيدي حقك هنا مباشرة عشان يشتغل الأدمن 🚨
+    # مثال: ADMIN_IDS = {290185541}
     ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+    
+    # إضافة الآيدي من المتغيرات أو يدوياً هنا
     if os.getenv("ADMIN_USER_ID"):
         if os.getenv("ADMIN_USER_ID").strip().isdigit():
             ADMIN_IDS.add(int(os.getenv("ADMIN_USER_ID")))
     
+    # للتجربة: إذا ما ضبطت المتغيرات، الغِ التعليق عن السطر التالي وضع رقمك:
+    # ADMIN_IDS.add(290185541)
+
     DB_FILE = os.getenv("DB_FILE", "data.db")
     QUESTIONS_FILE = os.getenv("QUESTIONS_FILE", "questions_from_word.json")
     
@@ -53,7 +60,8 @@ class Config:
     BAR_EMPTY = "⬜"
 
 if not Config.TOKEN:
-    raise RuntimeError("⚠️ BOT_TOKEN مفقود! تأكد من إعداد المتغيرات.")
+    # Config.TOKEN = "YOUR_TOKEN_HERE" # احتياط
+    pass
 
 # =========================
 # 🗄️ إدارة قاعدة البيانات
@@ -136,6 +144,10 @@ class DatabaseManager:
         with self._connect() as conn:
             conn.execute("DELETE FROM pending_names WHERE user_id=?", (user_id,))
 
+    def get_pending_requests(self):
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM pending_names ORDER BY requested_at")]
+
     def mark_seen(self, user_id: int, qid: str):
         with self._connect() as conn:
             conn.execute("INSERT OR IGNORE INTO seen_questions(user_id, qid) VALUES(?,?)", (user_id, qid))
@@ -169,6 +181,13 @@ class DatabaseManager:
                 FROM users WHERE is_approved=1 AND full_name IS NOT NULL 
                 ORDER BY total_points DESC, best_round_score DESC LIMIT {Config.TOP_N}
             """)]
+
+    def get_stats(self):
+        with self._connect() as conn:
+            users_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            rounds_count = conn.execute("SELECT COUNT(*) FROM rounds").fetchone()[0]
+            pending_count = conn.execute("SELECT COUNT(*) FROM pending_names").fetchone()[0]
+            return {"users": users_count, "rounds": rounds_count, "pending": pending_count}
 
 db = DatabaseManager(Config.DB_FILE)
 
@@ -250,8 +269,8 @@ class GameSession:
         self.correct_count = 0
         self.streak = 0
         self.history = []
-        self.current_term_correct = "" # تخزين الحرف الصحيح
-        self.current_term_text_map = {} # تخزين النصوص المقابلة للأحرف
+        self.current_term_correct = ""
+        self.current_term_text_map = {}
 
     @property
     def current_q(self):
@@ -302,7 +321,6 @@ class GameSession:
         return is_correct
 
     def get_correct_text(self):
-        """إرجاع النص الصحيح للسؤال الحالي لعرضه للمستخدم"""
         q = self.current_q
         if not q: return ""
         q_type = q.get('type')
@@ -310,7 +328,7 @@ class GameSession:
         if q_type == 'mcq':
             correct_key = str(q.get('correct', '')).upper()
             opts = q.get('options', {})
-            return opts.get(correct_key, correct_key) # يرجع نص الخيار
+            return opts.get(correct_key, correct_key)
         
         elif q_type == 'tf':
             truth_raw = q.get('answer', q.get('correct'))
@@ -318,7 +336,6 @@ class GameSession:
             return "صح" if truth else "خطأ"
             
         elif q_type == 'term':
-            # نستخدم الـ map الذي خزنناه وقت العرض
             return self.current_term_text_map.get(self.current_term_correct, q.get('term'))
             
         return ""
@@ -390,7 +407,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("القائمة الرئيسية:", reply_markup=main_menu_kb(user_id))
         except: pass
 
-# --- دالة عرض السؤال (مع إخفاء اسم الفصل) ---
+# --- دالة عرض السؤال (Clean UI) ---
 async def send_new_question(bot, chat_id, session: GameSession):
     if session.is_finished:
         await finish_game_msg(bot, chat_id, session)
@@ -400,7 +417,7 @@ async def send_new_question(bot, chat_id, session: GameSession):
     idx = session.current_idx + 1
     total = len(session.questions)
     
-    # تم إخفاء اسم الفصل من هنا حسب الطلب
+    # اسم الفصل مخفي
     text = f"**السؤال {idx}/{total}**\n"
     text += f"{session.get_progress_bar()}\n\n"
     
@@ -427,10 +444,10 @@ async def send_new_question(bot, chat_id, session: GameSession):
         opts = distractors + [correct]
         random.shuffle(opts)
         
-        session.current_term_text_map = {} # تصفير وتعبئة
+        session.current_term_text_map = {}
         for i, opt in enumerate(opts):
-            letter = chr(65+i) # A, B, C, D
-            session.current_term_text_map[letter] = opt # حفظ الرابط بين الحرف والنص
+            letter = chr(65+i)
+            session.current_term_text_map[letter] = opt
             kb.append([InlineKeyboardButton(opt, callback_data=f"ans:{letter}")])
             if opt == correct:
                 session.current_term_correct = letter
@@ -446,7 +463,6 @@ async def game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     chat_id = query.message.chat_id
     
-    # 🟢 1. بدء اللعبة
     if data == "game_start":
         questions = qm.get_round_questions(user_id)
         if not questions:
@@ -457,58 +473,48 @@ async def game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_new_question(context.bot, chat_id, session)
         return
 
-    # 🟢 2. التأكد من الجلسة
     session: GameSession = context.user_data.get('session')
     if not session:
         try: await context.bot.send_message(chat_id, "⚠️ انتهت الجلسة. اضغط /start من جديد.")
         except: pass
         return
 
-    # 🟢 3. الانسحاب
     if data == "game_quit":
         await finish_game_msg(context.bot, chat_id, session, surrendered=True)
         context.user_data.pop('session', None)
         return
 
-    # 🟢 4. معالجة الإجابة وتعديل السؤال القديم
     if data.startswith("ans:"):
         ans_val = data.split(":")[1]
         
-        # حفظ بيانات السؤال الحالي قبل التحديث للحصول على النص
         correct_text = session.get_correct_text()
         original_text = query.message.text_markdown
         
-        # التحقق وتحديث السكور
         is_correct = session.check_answer(ans_val)
         
-        # بناء نص النتيجة
+        # تفاصيل الإجابة مع السؤال السابق
         if is_correct:
             result_msg = f"✅ **إجابة صحيحة!**\nالجواب: {correct_text}"
         else:
             result_msg = f"❌ **إجابة خاطئة!**\nالصحيح هو: {correct_text}"
         
-        # 🔒 تعديل الرسالة القديمة (قفل السؤال)
         try:
             final_text = f"{original_text}\n\n───────────────\n{result_msg}"
             await query.edit_message_text(text=final_text, reply_markup=None, parse_mode="Markdown")
         except Exception as e:
             logger.warning(f"Edit error: {e}")
 
-        # 🎉 احتفال متحرك كل 3 إجابات (يظهر ويختفي)
+        # الاحتفال المتحرك
         if is_correct and session.streak > 0 and session.streak % 3 == 0:
             try:
-                # نرسل ستيكر ألعاب نارية (متحرك)
-                # ملاحظة: نستخدم هذا الـ ID الخاص بتليجرام للألعاب النارية أو نرسل Emoji متحرك
+                # 🎆 ستيكر ألعاب نارية
                 msg = await context.bot.send_message(chat_id, "🎆")
-                await asyncio.sleep(2.5) # ننتظر قليلاً
-                await msg.delete() # نحذف الرسالة (اختفاء)
+                await asyncio.sleep(2.5)
+                await msg.delete()
             except Exception:
                 pass 
 
-        # ⏳ تأخير بسيط لقراءة النتيجة
         await asyncio.sleep(0.5) 
-        
-        # 📤 إرسال السؤال التالي
         await send_new_question(context.bot, chat_id, session)
 
 async def finish_game_msg(bot, chat_id, session: GameSession, surrendered=False):
@@ -547,6 +553,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("✅ تم إرسال اسمك للمراجعة.", reply_markup=main_menu_kb(user_id))
     
+    # إشعار الأدمن
     for adm in Config.ADMIN_IDS:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ قبول", callback_data=f"adm_ok:{user_id}"), 
@@ -556,27 +563,85 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(adm, f"📝 **طلب اعتماد اسم**\n👤: {name}\n🆔: `{user_id}`", parse_mode="Markdown", reply_markup=kb)
         except: pass
 
+# =========================
+# 👮‍♂️ لوحة تحكم الأدمن (جديد)
+# =========================
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in Config.ADMIN_IDS:
+        await update.message.reply_text("⛔ هذا الأمر للمسؤولين فقط.")
+        return
+    
+    stats = db.get_stats()
+    txt = (
+        f"👮‍♂️ **لوحة التحكم**\n\n"
+        f"👥 المستخدمين: {stats['users']}\n"
+        f"🎮 الجولات الملعوبة: {stats['rounds']}\n"
+        f"⏳ طلبات الانتظار: {stats['pending']}\n"
+    )
+    
+    kb_rows = [
+        [InlineKeyboardButton("🔄 تحديث", callback_data="admin_refresh")]
+    ]
+    if stats['pending'] > 0:
+        kb_rows.insert(0, [InlineKeyboardButton(f"📋 عرض الطلبات المعلقة ({stats['pending']})", callback_data="admin_show_pending")])
+        
+    await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode="Markdown")
+
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = query.from_user.id
     
-    if query.from_user.id not in Config.ADMIN_IDS: return
+    if user_id not in Config.ADMIN_IDS: return
     
-    action, target_id = data.split(":")
-    target_id = int(target_id)
-    
-    if action == "adm_ok":
-        name = db.approve_user(target_id)
-        await query.edit_message_text(f"✅ تم اعتماد: {name}")
-        try: await context.bot.send_message(target_id, f"🎉 مبروك! تم اعتماد اسمك ({name})!")
+    if data == "admin_refresh":
+        stats = db.get_stats()
+        txt = (
+            f"👮‍♂️ **لوحة التحكم**\n\n"
+            f"👥 المستخدمين: {stats['users']}\n"
+            f"🎮 الجولات الملعوبة: {stats['rounds']}\n"
+            f"⏳ طلبات الانتظار: {stats['pending']}\n"
+        )
+        kb_rows = [[InlineKeyboardButton("🔄 تحديث", callback_data="admin_refresh")]]
+        if stats['pending'] > 0:
+            kb_rows.insert(0, [InlineKeyboardButton(f"📋 عرض الطلبات المعلقة ({stats['pending']})", callback_data="admin_show_pending")])
+        try:
+            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode="Markdown")
         except: pass
+        return
+
+    if data == "admin_show_pending":
+        pendings = db.get_pending_requests()
+        if not pendings:
+            await context.bot.send_message(user_id, "✅ لا توجد طلبات معلقة حالياً.")
+            return
         
-    elif action == "adm_no":
-        db.reject_user(target_id)
-        await query.edit_message_text(f"❌ تم رفض الطلب.")
-        try: await context.bot.send_message(target_id, "❌ تم رفض الاسم.")
-        except: pass
+        for p in pendings:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ قبول", callback_data=f"adm_ok:{p['user_id']}"), 
+                 InlineKeyboardButton("❌ رفض", callback_data=f"adm_no:{p['user_id']}")]
+            ])
+            await context.bot.send_message(user_id, f"📝 **طلب معلق**\n👤: {p['full_name']}\n🆔: `{p['user_id']}`", parse_mode="Markdown", reply_markup=kb)
+        return
+
+    # معالجة القبول والرفض
+    if data.startswith("adm_"):
+        action, target_id = data.split(":")
+        target_id = int(target_id)
+        
+        if action == "adm_ok":
+            name = db.approve_user(target_id)
+            await query.edit_message_text(f"✅ تم اعتماد: {name}")
+            try: await context.bot.send_message(target_id, f"🎉 مبروك! تم اعتماد اسمك ({name})!")
+            except: pass
+            
+        elif action == "adm_no":
+            db.reject_user(target_id)
+            await query.edit_message_text(f"❌ تم رفض الطلب.")
+            try: await context.bot.send_message(target_id, "❌ تم رفض الاسم.")
+            except: pass
 
 # =========================
 # 🚀 التشغيل الرئيسي
@@ -585,9 +650,12 @@ def main():
     app = Application.builder().token(Config.TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_command)) # ✅ تمت إضافة أمر الأدمن
+    
     app.add_handler(CallbackQueryHandler(menu_handler, pattern="^menu_"))
-    app.add_handler(CallbackQueryHandler(admin_handler, pattern="^adm_"))
+    app.add_handler(CallbackQueryHandler(admin_handler, pattern="^(adm_|admin_)"))
     app.add_handler(CallbackQueryHandler(game_handler, pattern="^(game_|ans:)"))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
     
     print(f"🤖 Bot started... (Admins: {Config.ADMIN_IDS})")

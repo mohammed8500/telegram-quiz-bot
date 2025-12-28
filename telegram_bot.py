@@ -4,14 +4,11 @@ import random
 import logging
 import re
 import sqlite3
+import hashlib
 from datetime import datetime
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Optional
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -37,8 +34,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in Railway Variables.")
 
-# Admin IDs: comma-separated telegram user ids (numbers)
+# Maintenance (env)
+MAINTENANCE_MODE_ENV = os.getenv("MAINTENANCE_MODE", "0").strip()  # "1" = on
+
+# Admin IDs (supports both ADMIN_USER_ID single, and ADMIN_IDS comma list)
 ADMIN_IDS = set()
+
+_admin_single = os.getenv("ADMIN_USER_ID", "").strip()
+if _admin_single.isdigit():
+    ADMIN_IDS.add(int(_admin_single))
+
 _admin_raw = os.getenv("ADMIN_IDS", "").strip()
 if _admin_raw:
     for x in _admin_raw.split(","):
@@ -77,47 +82,53 @@ def normalize_arabic(text: str) -> str:
     if not text:
         return ""
     text = text.strip()
-    text = _ARABIC_DIACRITICS.sub("", text)          # remove tashkeel/tatweel
-    text = re.sub(r"[^\u0600-\u06FF0-9\s]", " ", text) # remove punct except arabic/digits
+    text = _ARABIC_DIACRITICS.sub("", text)              # tashkeel/tatweel
+    # keep arabic + digits + spaces
+    text = re.sub(r"[^\u0600-\u06FF0-9\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
 
-    # normalize alifs
+    # normalize common letters
     text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
     text = text.replace("ى", "ي").replace("ة", "ه")
     return text
 
 def is_arabic_only_name(name: str) -> bool:
-    """Arabic letters + spaces only (no English)."""
     if not name:
         return False
     name = name.strip()
-    # reject latin chars
     if re.search(r"[A-Za-z]", name):
         return False
-    # allow arabic letters and spaces
     return bool(re.fullmatch(r"[\u0600-\u06FF\s]+", name))
 
 def looks_like_real_name(name: str) -> bool:
     """
-    قواعد بسيطة عشان الاسم يكون 'حقيقي واضح':
+    قواعد بسيطة:
     - عربي فقط
     - كلمتين على الأقل
     - طول مناسب
+    - بدون كلمات سيئة (BAD_WORDS)
     """
     name = name.strip()
     if not is_arabic_only_name(name):
         return False
+
     parts = [p for p in name.split() if p]
     if len(parts) < 2:
         return False
+
     if len(name) < 6 or len(name) > 30:
         return False
-    # reject bad words
+
     n_norm = normalize_arabic(name)
     for bw in BAD_WORDS:
-        if bw and normalize_arabic(bw) in n_norm:
+        bw_norm = normalize_arabic(bw)
+        if bw_norm and bw_norm in n_norm:
             return False
+
     return True
+
+def strip_al(s: str) -> str:
+    return re.sub(r"^ال", "", s)
 
 # =========================
 # DB
@@ -173,8 +184,45 @@ def db_init():
         )
     """)
 
+    # settings table for runtime toggles (maintenance on/off)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    # ensure maintenance default exists
+    cur.execute("""
+        INSERT OR IGNORE INTO settings(key, value) VALUES ('maintenance', '0')
+    """)
+
     conn.commit()
     conn.close()
+
+def get_setting(key: str, default: str = "0") -> str:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM settings WHERE key=? LIMIT 1", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return str(row["value"]) if row else default
+
+def set_setting(key: str, value: str) -> None:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO settings(key, value) VALUES (?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (key, value))
+    conn.commit()
+    conn.close()
+
+def is_maintenance_active() -> bool:
+    # active if env is 1 OR DB toggle is 1
+    env_on = (MAINTENANCE_MODE_ENV == "1")
+    db_on = (get_setting("maintenance", "0") == "1")
+    return env_on or db_on
 
 def upsert_user(user_id: int):
     now = datetime.utcnow().isoformat()
@@ -246,13 +294,13 @@ def get_pending_list() -> List[Dict[str, Any]]:
 def mark_seen(user_id: int, qid: str):
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT OR IGNORE INTO seen_questions(user_id, qid) VALUES(?,?)
-    """, (user_id, qid))
+    cur.execute("INSERT OR IGNORE INTO seen_questions(user_id, qid) VALUES(?,?)", (user_id, qid))
     conn.commit()
     conn.close()
 
 def has_seen(user_id: int, qid: str) -> bool:
+    if not qid:
+        return False
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM seen_questions WHERE user_id=? AND qid=? LIMIT 1", (user_id, qid))
@@ -264,12 +312,12 @@ def save_round_result(user_id: int, score: int, bonus: int, correct: int, total:
     now = datetime.utcnow().isoformat()
     conn = db_connect()
     cur = conn.cursor()
+
     cur.execute("""
         INSERT INTO rounds(user_id, started_at, finished_at, score, bonus, correct, total)
         VALUES(?,?,?,?,?,?,?)
     """, (user_id, now, now, score, bonus, correct, total))
 
-    # update user aggregate
     cur.execute("SELECT total_points, rounds_played, best_round_score FROM users WHERE user_id=?", (user_id,))
     row = cur.fetchone()
     if row:
@@ -300,35 +348,117 @@ def get_leaderboard(top_n: int) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 # =========================
-# Questions load + chapter auto-classification
+# Questions load + normalize + chapter auto-classification
 # =========================
+def _stable_qid(item: Dict[str, Any]) -> str:
+    blob = json.dumps(item, ensure_ascii=False, sort_keys=True)
+    return hashlib.md5(blob.encode("utf-8")).hexdigest()[:12]
+
+def normalize_question_item(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Supports types:
+      - mcq: question, options {A,B,C,D}, correct (A/B/C/D OR option text)
+      - tf: statement, answer (bool or "صح/خطأ")
+      - term: term, definition
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    qtype = raw.get("type") or raw.get("نوع_السؤال") or raw.get("النوع")
+    if not qtype:
+        return None
+
+    qtype = str(qtype).strip().lower()
+    item: Dict[str, Any] = {}
+
+    # map common Arabic labels
+    if qtype in ["mcq", "اختيار من متعدد", "اختيار", "multiple choice"]:
+        item["type"] = "mcq"
+        item["question"] = raw.get("question") or raw.get("السؤال") or ""
+        opts = raw.get("options") or raw.get("الخيارات") or {}
+        if isinstance(opts, list):
+            # list -> A,B,C,D
+            keys = ["A", "B", "C", "D"]
+            opts = {keys[i]: str(opts[i]) for i in range(min(4, len(opts)))}
+        item["options"] = opts if isinstance(opts, dict) else {}
+        item["correct"] = (raw.get("correct") or raw.get("الإجابة") or raw.get("answer") or "").strip()
+
+    elif qtype in ["tf", "صح او خطأ", "صح أو خطأ", "true/false", "صح وخطأ"]:
+        item["type"] = "tf"
+        item["statement"] = raw.get("statement") or raw.get("السؤال") or raw.get("عبارة") or raw.get("statement_text") or ""
+        ans = raw.get("answer") if "answer" in raw else raw.get("الإجابة")
+        if isinstance(ans, bool):
+            item["answer"] = ans
+        else:
+            ans_s = normalize_arabic(str(ans or ""))
+            # accept "صح" / "صحيح" / "خطا" / "خاطئ"
+            if "صح" in ans_s or "صحيح" in ans_s:
+                item["answer"] = True
+            elif "خطا" in ans_s or "خاط" in ans_s:
+                item["answer"] = False
+            else:
+                # fallback: unknown -> False
+                item["answer"] = False
+
+    elif qtype in ["term", "مصطلح", "مصطلح علمي", "تعريف"]:
+        item["type"] = "term"
+        item["term"] = raw.get("term") or raw.get("المصطلح") or raw.get("الإجابة") or ""
+        item["definition"] = raw.get("definition") or raw.get("التعريف") or raw.get("question") or raw.get("السؤال") or ""
+
+    else:
+        return None
+
+    # ensure id
+    item["id"] = str(raw.get("id") or raw.get("qid") or raw.get("ID") or "").strip()
+    if not item["id"]:
+        item["id"] = _stable_qid(item)
+
+    return item
+
 def load_questions() -> List[Dict[str, Any]]:
     with open(QUESTIONS_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    items = data.get("items", [])
+
+    # accept multiple shapes
+    if isinstance(data, list):
+        raw_items = data
+    elif isinstance(data, dict):
+        raw_items = data.get("items") or data.get("questions") or []
+    else:
+        raw_items = []
+
+    items: List[Dict[str, Any]] = []
+    for r in raw_items:
+        q = normalize_question_item(r)
+        if q:
+            items.append(q)
     return items
 
-# كلمات مفتاحية بسيطة للتصنيف التلقائي (مو لازم تكون مثالية، لكنها تمشي)
+# Keywords for auto classification
 CHAPTER_KEYWORDS = {
     "طبيعة العلم": [
-        "الطريقه العلميه", "فرضيه", "متغير", "ثابت", "ملاحظه", "تجربه", "استنتاج", "تواصل", "علم الاثار", "الرادار"
+        "الطريقه العلميه", "فرضيه", "متغير", "ثابت", "ملاحظه", "تجربه", "استنتاج", "تواصل",
+        "علم الاثار", "الرادار", "خرائط", "نماذج", "قياس"
     ],
     "المخاليط والمحاليل": [
-        "مخلوط", "محلول", "مذيب", "مذاب", "تركيز", "ذائبيه", "حمض", "قاعده", "تعادل", "ترسب", "pH", "ايوني", "تساهمي"
+        "مخلوط", "محلول", "مذيب", "مذاب", "تركيز", "ذائبيه", "حمض", "قاعده", "تعادل", "ترسب",
+        "معلق", "غرويات", "ترشيح", "تقطير"
     ],
     "حالات المادة": [
-        "صلب", "سائل", "غاز", "بلازما", "انصهار", "تبخر", "تكاثف", "تجمد", "تسامي", "ضغط", "كثافه", "توتر سطحي", "لزوج"
+        "صلب", "سائل", "غاز", "بلازما", "انصهار", "تبخر", "تكاثف", "تجمد", "تسامي",
+        "ضغط", "كثافه", "لزوج", "حجم", "كتله"
     ],
     "الطاقة وتحولاتها": [
-        "طاقه", "حركيه", "وضع", "كامنه", "اشعاعيه", "كيميائيه", "كهربائيه", "نوويه", "توربين", "مولد", "خليه شمسيه", "حفظ الطاقه"
+        "طاقه", "حركيه", "وضع", "كامنه", "اشعاعيه", "كيميائيه", "كهربائيه", "نوويه",
+        "حفظ الطاقه", "تحول", "متحوله", "مولد", "توربين"
     ],
     "أجهزة الجسم": [
-        "دم", "قلب", "شريان", "وريد", "شعيره", "مناعه", "اجسام مضاده", "مولدات الضد", "ايدز", "سكري", "هضم", "معده", "امعاء", "رئه", "تنفس", "كليه", "بول"
+        "دم", "قلب", "شريان", "وريد", "شعيره", "مناعه", "اجسام مضاده", "مولدات الضد",
+        "هضم", "معده", "امعاء", "رئه", "تنفس", "كليه", "بول", "عصب", "عضلات"
     ],
 }
 
 def classify_chapter(item: Dict[str, Any]) -> str:
-    # نص نجمعه للتصنيف
     blob = ""
     if item.get("type") == "mcq":
         blob = item.get("question", "")
@@ -336,64 +466,119 @@ def classify_chapter(item: Dict[str, Any]) -> str:
     elif item.get("type") == "tf":
         blob = item.get("statement", "")
     elif item.get("type") == "term":
-        blob = item.get("term", "") + " " + item.get("definition", "")
+        blob = (item.get("term", "") + " " + item.get("definition", "")).strip()
 
     blob_n = normalize_arabic(blob)
-    best = "حالات المادة"
-    best_score = 0
+    best = CHAPTERS[0]
+    best_score = -1
+
     for chap, kws in CHAPTER_KEYWORDS.items():
         score = 0
         for kw in kws:
-            if kw and normalize_arabic(kw) in blob_n:
+            kw_n = normalize_arabic(kw)
+            if kw_n and kw_n in blob_n:
                 score += 1
         if score > best_score:
             best_score = score
             best = chap
-    return best
+
+    # لو ما لقى شيء، خليها "حالات المادة" كافتراضي
+    return best if best in CHAPTERS else "حالات المادة"
 
 def build_chapter_buckets(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     buckets = {c: [] for c in CHAPTERS}
     for it in items:
         chap = classify_chapter(it)
         it["_chapter"] = chap
-        if chap in buckets:
-            buckets[chap].append(it)
-        else:
-            buckets["حالات المادة"].append(it)
+        buckets.setdefault(chap, []).append(it)
+    # ensure all chapters exist
+    for c in CHAPTERS:
+        buckets.setdefault(c, [])
     return buckets
+
+def _calc_targets(user_id: int, buckets: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
+    """
+    توزيع نسبي مع تغطية جميع الفصول:
+    - نعطي حد أدنى 2 لكل فصل (إذا متوفر)
+    - الباقي يتوزع حسب عدد الأسئلة غير المشاهدة بكل فصل
+    """
+    min_each = 2
+    base = {c: 0 for c in CHAPTERS}
+
+    # unseen counts
+    unseen_counts = {}
+    for c in CHAPTERS:
+        pool = buckets.get(c, [])
+        unseen = [q for q in pool if not has_seen(user_id, q.get("id", ""))]
+        unseen_counts[c] = len(unseen)
+
+    # assign minimums where possible
+    assigned = 0
+    for c in CHAPTERS:
+        if unseen_counts[c] >= min_each:
+            base[c] = min_each
+            assigned += min_each
+        elif unseen_counts[c] > 0:
+            base[c] = unseen_counts[c]
+            assigned += unseen_counts[c]
+        else:
+            base[c] = 0
+
+    remaining = ROUND_SIZE - assigned
+    if remaining <= 0:
+        return base
+
+    # proportional distribute remaining based on unseen_counts
+    total_unseen = sum(unseen_counts.values()) or 1
+    weights = {c: unseen_counts[c] / total_unseen for c in CHAPTERS}
+
+    # add 1-by-1 to avoid rounding gaps
+    while remaining > 0:
+        # pick chapter with max (weight and still has capacity)
+        candidates = []
+        for c in CHAPTERS:
+            cap = unseen_counts[c] - base[c]
+            if cap > 0:
+                candidates.append(c)
+        if not candidates:
+            break
+
+        # choose best candidate by weight
+        c_best = max(candidates, key=lambda c: weights[c])
+        base[c_best] += 1
+        remaining -= 1
+
+    # if still remaining (means unseen not enough), we’ll later fill from any questions (including seen)
+    return base
 
 def pick_round_questions(user_id: int, buckets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """
-    20 سؤال موزع على الفصول 5:
-    الافتراضي 4 من كل فصل = 20
-    لو فصل ما يكفي، نعوض من الفصول الباقية.
-    مع تجنب تكرار الأسئلة للمستخدم قدر الإمكان.
+    20 سؤال تغطي الفصول الخمسة بتوزيع نسبي + تقليل التكرار قدر الإمكان.
     """
-    target_per_chapter = {c: ROUND_SIZE // len(CHAPTERS) for c in CHAPTERS}  # 4 لكل فصل
+    targets = _calc_targets(user_id, buckets)
+
     chosen: List[Dict[str, Any]] = []
+    leftovers_unseen: List[Dict[str, Any]] = []
 
-    # أولاً: نحاول نأخذ لكل فصل حصته
-    leftovers: List[Dict[str, Any]] = []
-
+    # pick per chapter
     for chap in CHAPTERS:
         pool = buckets.get(chap, [])
-        # فلترة الأسئلة اللي ما شافها المستخدم
         unseen = [q for q in pool if not has_seen(user_id, q.get("id", ""))]
         random.shuffle(unseen)
-        take = target_per_chapter[chap]
+
+        take = targets.get(chap, 0)
         taken = unseen[:take]
         chosen.extend(taken)
 
-        # الباقي (للتعويض إذا نقص فصل ثاني)
-        leftovers.extend(unseen[take:])
+        leftovers_unseen.extend(unseen[take:])
 
-    # إذا نقصنا عن 20، نكمل من أي unseen باقي
+    # fill remaining from unseen leftovers
     if len(chosen) < ROUND_SIZE:
-        random.shuffle(leftovers)
+        random.shuffle(leftovers_unseen)
         need = ROUND_SIZE - len(chosen)
-        chosen.extend(leftovers[:need])
+        chosen.extend(leftovers_unseen[:need])
 
-    # إذا ما زال نقص (مثلاً المستخدم شاف كل شيء)، نسمح بتكرار بشكل عادي
+    # if still short, allow repeats from all items
     if len(chosen) < ROUND_SIZE:
         all_items = []
         for chap in CHAPTERS:
@@ -402,7 +587,7 @@ def pick_round_questions(user_id: int, buckets: Dict[str, List[Dict[str, Any]]])
         need = ROUND_SIZE - len(chosen)
         chosen.extend(all_items[:need])
 
-    # شيل أي تكرار داخل الجولة نفسها
+    # unique by id
     seen_ids = set()
     uniq = []
     for q in chosen:
@@ -411,15 +596,19 @@ def pick_round_questions(user_id: int, buckets: Dict[str, List[Dict[str, Any]]])
             uniq.append(q)
             seen_ids.add(qid)
 
-    # إذا صاروا أقل من 20 بسبب إزالة التكرار، عوّض من أي شيء
-    while len(uniq) < ROUND_SIZE:
+    # top-up if uniqueness reduced count
+    if len(uniq) < ROUND_SIZE:
         all_items = []
         for chap in CHAPTERS:
             all_items.extend(buckets.get(chap, []))
-        extra = random.choice(all_items)
-        if extra.get("id") not in seen_ids:
-            uniq.append(extra)
-            seen_ids.add(extra.get("id"))
+        random.shuffle(all_items)
+        for extra in all_items:
+            if len(uniq) >= ROUND_SIZE:
+                break
+            qid = extra.get("id")
+            if qid and qid not in seen_ids:
+                uniq.append(extra)
+                seen_ids.add(qid)
 
     random.shuffle(uniq)
     return uniq[:ROUND_SIZE]
@@ -442,7 +631,7 @@ def main_menu_keyboard(user: Dict[str, Any]) -> InlineKeyboardMarkup:
 def answer_keyboard_mcq(options: Dict[str, str]) -> InlineKeyboardMarkup:
     rows = []
     for key in ["A", "B", "C", "D"]:
-        if key in options:
+        if key in options and str(options[key]).strip():
             rows.append([InlineKeyboardButton(f"{key}) {options[key]}", callback_data=f"ans_mcq:{key}")])
     rows.append([InlineKeyboardButton("⛔️ إنهاء الجولة", callback_data="end_round")])
     return InlineKeyboardMarkup(rows)
@@ -458,31 +647,74 @@ def answer_keyboard_tf() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 def admin_pending_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = [
-        [
-            InlineKeyboardButton("✅ موافق", callback_data=f"admin_approve:{user_id}"),
-            InlineKeyboardButton("❌ رفض", callback_data=f"admin_reject:{user_id}")
-        ]
-    ]
+    kb = [[
+        InlineKeyboardButton("✅ موافق", callback_data=f"admin_approve:{user_id}"),
+        InlineKeyboardButton("❌ رفض", callback_data=f"admin_reject:{user_id}")
+    ]]
     return InlineKeyboardMarkup(kb)
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+async def block_if_maintenance(update_or_query, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Returns True if blocked (maintenance active and not admin)
+    """
+    if not is_maintenance_active():
+        return False
+
+    # determine user_id and reply method
+    user_id = None
+    reply_func = None
+
+    if hasattr(update_or_query, "effective_user"):
+        user_id = update_or_query.effective_user.id
+        if update_or_query.message:
+            reply_func = update_or_query.message.reply_text
+    else:
+        # callback query object
+        user_id = update_or_query.from_user.id
+        reply_func = update_or_query.message.reply_text
+
+    if user_id is not None and not is_admin(user_id):
+        await reply_func("🛠️ البوت تحت الصيانة الآن.\nارجع بعد شوي 🙏")
+        return True
+
+    return False
+
 # =========================
-# Game state stored per user (in memory)
+# Game flow helpers
 # =========================
-# context.user_data keys:
-# round_questions: list
-# round_index: int
-# round_score: int
-# round_bonus: int
-# round_correct: int
-# round_streak: int
-# round_chapter_correct: dict
-# current_q: dict
+def calc_streak_bonus(streak: int) -> int:
+    return streak // STREAK_BONUS_EVERY
+
+def _mcq_is_correct(q: Dict[str, Any], picked_letter: str) -> bool:
+    correct = (q.get("correct") or "").strip()
+    if not correct:
+        return False
+
+    # if correct is A/B/C/D
+    c_up = correct.upper().strip()
+    if c_up in ["A", "B", "C", "D"]:
+        return picked_letter.upper() == c_up
+
+    # else treat correct as option text
+    options = q.get("options") or {}
+    picked_text = str(options.get(picked_letter.upper(), "")).strip()
+    return normalize_arabic(picked_text) == normalize_arabic(correct)
+
+def _tf_is_correct(q: Dict[str, Any], picked: str) -> bool:
+    correct_val = q.get("answer", False)
+    correct_bool = bool(correct_val)
+    return picked == ("true" if correct_bool else "false")
 
 # =========================
 # Handlers
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_maintenance(update, context):
+        return
+
     user_id = update.effective_user.id
     upsert_user(user_id)
     user = get_user(user_id)
@@ -500,6 +732,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if await block_if_maintenance(query, context):
+        return
+
     user_id = query.from_user.id
     upsert_user(user_id)
     user = get_user(user_id)
@@ -554,49 +790,82 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_round(query, context)
         return
 
-async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_name"):
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Single text handler: handles name input and term answers.
+    """
+    if await block_if_maintenance(update, context):
         return
 
-    user_id = update.effective_user.id
-    name = (update.message.text or "").strip()
+    # name flow
+    if context.user_data.get("awaiting_name"):
+        user_id = update.effective_user.id
+        name = (update.message.text or "").strip()
 
-    if not looks_like_real_name(name):
+        if not looks_like_real_name(name):
+            await update.message.reply_text(
+                "❌ الاسم ما ينفع حسب الشروط.\n"
+                "اكتبه عربي فقط وبكلمتين على الأقل وبشكل محترم.\n"
+                "جرّب مرة ثانية 👇"
+            )
+            return
+
+        upsert_user(user_id)
+        set_pending_name(user_id, name)
+        context.user_data["awaiting_name"] = False
+
         await update.message.reply_text(
-            "❌ الاسم ما ينفع حسب الشروط.\n"
-            "اكتبه عربي فقط وبكلمتين على الأقل وبشكل محترم.\n"
-            "جرّب مرة ثانية 👇"
+            "✅ تم استلام الاسم.\n"
+            "صار بانتظار موافقة الأدمن 👑\n"
+            "تقدر تلعب الحين، بس لوحة التميز ما تظهر إلا بعد الاعتماد."
         )
+
+        # notify admins
+        if ADMIN_IDS:
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"📝 طلب اعتماد اسم:\n• المستخدم: {user_id}\n• الاسم: {name}",
+                        reply_markup=admin_pending_keyboard(user_id)
+                    )
+                except Exception as e:
+                    logger.warning("Failed notifying admin %s: %s", admin_id, e)
         return
 
-    # store pending and notify admins
-    upsert_user(user_id)
-    set_pending_name(user_id, name)
-    context.user_data["awaiting_name"] = False
+    # term answer flow
+    if context.user_data.get("awaiting_term_answer") and "round_questions" in context.user_data:
+        q = context.user_data.get("current_q")
+        if not q or q.get("type") != "term":
+            context.user_data["awaiting_term_answer"] = False
+            return
 
-    await update.message.reply_text(
-        "✅ تم استلام الاسم.\n"
-        "صار بانتظار موافقة الأدمن 👑\n"
-        "تقدر تلعب الحين، بس لوحة التميز ما تظهر إلا بعد الاعتماد."
-    )
+        user_answer = normalize_arabic(update.message.text or "")
+        correct_term = normalize_arabic(q.get("term") or "")
 
-    # notify admins
-    if ADMIN_IDS:
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=f"📝 طلب اعتماد اسم:\n• المستخدم: {user_id}\n• الاسم: {name}",
-                    reply_markup=admin_pending_keyboard(user_id)
-                )
-            except Exception as e:
-                logger.warning("Failed notifying admin %s: %s", admin_id, e)
+        is_correct = (
+            user_answer == correct_term
+            or strip_al(user_answer) == strip_al(correct_term)
+        )
+
+        context.user_data["awaiting_term_answer"] = False
+
+        # create dummy-like object with message + from_user
+        class Dummy:
+            def __init__(self, msg):
+                self.message = msg
+                self.from_user = msg.from_user
+
+        dummy = Dummy(update.message)
+        await apply_answer_result(dummy, context, is_correct)
+        return
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     admin_id = query.from_user.id
-    if admin_id not in ADMIN_IDS:
+
+    if not is_admin(admin_id):
         await query.edit_message_text("❌ ما لك صلاحية هنا.")
         return
 
@@ -623,7 +892,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_user.id
-    if admin_id not in ADMIN_IDS:
+    if not is_admin(admin_id):
         await update.message.reply_text("❌ الأمر هذا للأدمن فقط.")
         return
 
@@ -640,20 +909,33 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=admin_pending_keyboard(uid)
         )
 
+async def maintenance_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if not is_admin(admin_id):
+        await update.message.reply_text("❌ الأمر هذا للأدمن فقط.")
+        return
+    set_setting("maintenance", "1")
+    await update.message.reply_text("🛠️ تم تشغيل وضع الصيانة ✅\n(المستخدمين ما يقدرون يستخدمون البوت)")
+
+async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if not is_admin(admin_id):
+        await update.message.reply_text("❌ الأمر هذا للأدمن فقط.")
+        return
+    set_setting("maintenance", "0")
+    await update.message.reply_text("✅ تم إيقاف وضع الصيانة.\nالبوت رجع متاح للكل 👌")
+
 async def start_round(query, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     upsert_user(user_id)
 
-    # load and pick questions
-    items = context.bot_data.get("questions_items")
     buckets = context.bot_data.get("questions_buckets")
-    if not items or not buckets:
-        await query.edit_message_text("❌ ملف الأسئلة غير جاهز. تأكد أن questions_from_word.json موجود.")
+    if not buckets:
+        await query.message.reply_text("❌ ملف الأسئلة غير جاهز. تأكد أن questions_from_word.json موجود وبصيغة صحيحة.")
         return
 
     round_questions = pick_round_questions(user_id, buckets)
 
-    # init round state
     context.user_data["round_questions"] = round_questions
     context.user_data["round_index"] = 0
     context.user_data["round_score"] = 0
@@ -663,7 +945,7 @@ async def start_round(query, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["round_chapter_correct"] = {c: 0 for c in CHAPTERS}
     context.user_data["round_chapter_total"] = {c: 0 for c in CHAPTERS}
 
-    await query.edit_message_text("🎮 بدأنا الجولة! جاهز؟ 🔥")
+    await query.message.reply_text("🎮 بدأنا الجولة! جاهز؟ 🔥")
     await send_next_question(query, context)
 
 async def send_next_question(query, context: ContextTypes.DEFAULT_TYPE):
@@ -684,14 +966,14 @@ async def send_next_question(query, context: ContextTypes.DEFAULT_TYPE):
     header = f"🧩 الفصل: {chap}\n📌 السؤال {idx+1}/{ROUND_SIZE}\n\n"
 
     if q.get("type") == "mcq":
-        question = q.get("question", "").strip()
+        question = (q.get("question") or "").strip()
         options = q.get("options") or {}
         text = header + f"❓ {question}"
         await query.message.reply_text(text, reply_markup=answer_keyboard_mcq(options))
         return
 
     if q.get("type") == "tf":
-        st = q.get("statement", "").strip()
+        st = (q.get("statement") or "").strip()
         text = header + f"✅/❌ {st}"
         await query.message.reply_text(text, reply_markup=answer_keyboard_tf())
         return
@@ -708,16 +990,13 @@ async def send_next_question(query, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["round_index"] = idx + 1
     await send_next_question(query, context)
 
-def calc_streak_bonus(streak: int) -> int:
-    # كل 3 صح = +1
-    return streak // STREAK_BONUS_EVERY
-
 async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
 
-    # round must exist
+    if await block_if_maintenance(query, context):
+        return
+
     if "round_questions" not in context.user_data:
         await query.message.reply_text("ابدأ جولة من القائمة 👇\nاكتب /start")
         return
@@ -729,7 +1008,6 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # end
     if data == "end_round":
         await finish_round(query, context, ended_by_user=True)
         return
@@ -737,50 +1015,18 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_correct = False
 
     if q.get("type") == "mcq" and data.startswith("ans_mcq:"):
-        picked = data.split(":")[1]
-        correct = (q.get("correct") or "").strip().upper()
-        is_correct = (picked == correct)
+        picked = data.split(":")[1].strip().upper()
+        is_correct = _mcq_is_correct(q, picked)
 
     elif q.get("type") == "tf" and data.startswith("ans_tf:"):
-        picked = data.split(":")[1]
-        correct = bool(q.get("answer"))
-        is_correct = (picked == ("true" if correct else "false"))
+        picked = data.split(":")[1].strip().lower()
+        is_correct = _tf_is_correct(q, picked)
 
     else:
         await query.message.reply_text("⚠️ إجابة غير متوقعة.")
         return
 
     await apply_answer_result(query, context, is_correct)
-
-async def term_answer_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_term_answer"):
-        return
-    if "round_questions" not in context.user_data:
-        return
-
-    q = context.user_data.get("current_q")
-    if not q or q.get("type") != "term":
-        return
-
-    user_answer = normalize_arabic(update.message.text or "")
-    correct_term = normalize_arabic(q.get("term") or "")
-
-    # تساهل: إزالة "ال" من البداية
-    def strip_al(s: str) -> str:
-        return re.sub(r"^ال", "", s)
-
-    is_correct = (user_answer == correct_term) or (strip_al(user_answer) == strip_al(correct_term))
-
-    context.user_data["awaiting_term_answer"] = False
-    # نحتاج query-like object لإرسال التالي، بس نستخدم update.message كمنطلق
-    # نسوي رد بسيط هنا ثم نرسل السؤال التالي عن طريق fake call
-    class DummyQuery:
-        def __init__(self, msg):
-            self.message = msg
-            self.from_user = msg.from_user
-
-    dummy = DummyQuery(update.message)
-    await apply_answer_result(dummy, context, is_correct)
 
 async def apply_answer_result(query, context: ContextTypes.DEFAULT_TYPE, is_correct: bool):
     idx = context.user_data.get("round_index", 0)
@@ -793,7 +1039,6 @@ async def apply_answer_result(query, context: ContextTypes.DEFAULT_TYPE, is_corr
         context.user_data["round_streak"] += 1
         context.user_data["round_chapter_correct"][chap] = context.user_data["round_chapter_correct"].get(chap, 0) + 1
 
-        # streak bonus
         streak = context.user_data["round_streak"]
         if streak % STREAK_BONUS_EVERY == 0:
             context.user_data["round_bonus"] += 1
@@ -822,10 +1067,8 @@ async def finish_round(query, context: ContextTypes.DEFAULT_TYPE, ended_by_user:
     correct = int(context.user_data.get("round_correct", 0))
     total = ROUND_SIZE
 
-    # حفظ النتيجة
     save_round_result(user_id, score, bonus, correct, total)
 
-    # ملخص الفصل
     chap_correct = context.user_data.get("round_chapter_correct", {})
     chap_total = context.user_data.get("round_chapter_total", {})
 
@@ -840,15 +1083,14 @@ async def finish_round(query, context: ContextTypes.DEFAULT_TYPE, ended_by_user:
     for c in CHAPTERS:
         cc = chap_correct.get(c, 0)
         tt = chap_total.get(c, 0)
-        if tt == 0:
-            continue
-        lines.append(f"• {c}: {cc}/{tt}")
+        if tt:
+            lines.append(f"• {c}: {cc}/{tt}")
 
     if not user.get("is_approved", 0):
         lines.append("")
         lines.append("ℹ️ تقدر تجمع نقاط، بس لوحة التميز تظهر بعد اعتماد اسمك ✅")
 
-    # تنظيف حالة الجولة
+    # clear round state
     for k in [
         "round_questions", "round_index", "round_score", "round_bonus",
         "round_correct", "round_streak", "round_chapter_correct",
@@ -858,7 +1100,6 @@ async def finish_round(query, context: ContextTypes.DEFAULT_TYPE, ended_by_user:
 
     await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    # ارجع للقائمة
     upsert_user(user_id)
     user = get_user(user_id)
     await query.message.reply_text("اختر من القائمة 👇", reply_markup=main_menu_keyboard(user))
@@ -867,9 +1108,24 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "الأوامر:\n"
         "/start — تشغيل البوت\n"
-        "/pending — للأدمن: عرض الطلبات المعلّقة\n"
+        "/pending — للأدمن: عرض طلبات الأسماء\n"
+        "/maintenance_on — للأدمن: تشغيل الصيانة\n"
+        "/maintenance_off — للأدمن: إيقاف الصيانة\n"
     )
     await update.message.reply_text(msg)
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled error: %s", context.error)
+    # notify admins (best-effort)
+    if ADMIN_IDS:
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"⚠️ خطأ في البوت:\n{repr(context.error)}"
+                )
+            except Exception:
+                pass
 
 # =========================
 # Main
@@ -877,9 +1133,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     db_init()
 
-    # load questions once
     try:
         items = load_questions()
+        logger.info("Loaded %s questions from %s", len(items), QUESTIONS_FILE)
     except Exception as e:
         logger.exception("Failed loading questions file: %s", e)
         items = []
@@ -887,26 +1143,27 @@ def main():
     buckets = build_chapter_buckets(items) if items else None
 
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # store questions globally
-    app.bot_data["questions_items"] = items
     app.bot_data["questions_buckets"] = buckets
 
     # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("pending", pending_command))
+    app.add_handler(CommandHandler("maintenance_on", maintenance_on))
+    app.add_handler(CommandHandler("maintenance_off", maintenance_off))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
-    app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^(ans_mcq:|ans_tf:|end_round)"))
+    app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^(ans_mcq:|ans_tf:|end_round)$"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(play_round|leaderboard|my_stats|set_name)$"))
 
-    # Text messages
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), receive_name))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), term_answer_text))
+    # Text
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_text))
 
-    logger.info("Bot started.")
+    # Error handler
+    app.add_error_handler(error_handler)
+
+    logger.info("Bot started. Admins=%s Maintenance(env)=%s", list(ADMIN_IDS), MAINTENANCE_MODE_ENV)
     app.run_polling()
 
 if __name__ == "__main__":

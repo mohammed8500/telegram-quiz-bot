@@ -999,7 +999,7 @@ def main():
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
-    app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^(ans_mcq:|ans_tf:|end_round)$"))
+    app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^(ans_mcq:|ans_tf:|end_round)"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(play_round|leaderboard|my_stats|set_name)$"))
 
     # Text messages (Router واحد يحل مشكلة التعارض)

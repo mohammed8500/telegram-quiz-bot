@@ -104,7 +104,7 @@ class GameAssets:
     BTN_RESET = "♻️ بنك جديد"
     BTN_HELP  = "💡 الفزعة"
     
-    # رسالة الترحيب (الافتتاحية المطلوبة)
+    # رسالة الترحيب
     WELCOME_MSG = """
 يا مرحبا ترحيبة البدو للعيد ⛺✨
 حي الله عالِم المستقبل 🎓
@@ -123,7 +123,6 @@ class GameAssets:
 • في الأسئلة المقالية، اكتب الإجابة وأرسلها (بدون فلسفة زايدة 😉).
 • إذا توهقت، اضغط *تخطي*.
 • شيك على درجاتك من زر *وش سويت؟*.
-• المشرف يقدر يشوف العدد بالأمر /admin
 
 بالتوفيق يا ذيبان! 🌟
 """
@@ -326,7 +325,7 @@ class EducationalBot:
     def register_handlers(self):
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CommandHandler("help", self.cmd_help))
-        self.app.add_handler(CommandHandler("admin", self.cmd_admin)) # الأمر الجديد
+        self.app.add_handler(CommandHandler("admin", self.cmd_admin)) 
         
         self.app.add_handler(MessageHandler(filters.Regex(f"^{GameAssets.BTN_START}$"), self.action_start_quiz))
         self.app.add_handler(MessageHandler(filters.Regex(f"^{GameAssets.BTN_STATS}$"), self.action_stats))
@@ -355,7 +354,13 @@ class EducationalBot:
         )
 
     async def cmd_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # لعرض الإحصائيات
+        # 🔒 تم وضع الآيدي الخاص بك هنا للحماية
+        ADMIN_ID = 290185541 
+        
+        # إذا لم يكن المستخدم هو المشرف، نتجاهل الأمر
+        if update.effective_user.id != ADMIN_ID:
+            return 
+
         total, active = self.db.get_stats()
         msg = f"""
 👮‍♂️ *لوحة المشرف*
@@ -456,7 +461,7 @@ class EducationalBot:
 
         keyboard.append([InlineKeyboardButton("⏭️ تخطي السؤال", callback_data="skip")])
         
-        # نرسل السؤال كرسالة جديدة دائماً للحفاظ على السجل
+        # إرسال السؤال كرسالة جديدة
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=msg_text,
@@ -484,6 +489,7 @@ class EducationalBot:
 
             session.current_index += 1
             self.db.save_session(session)
+            
             await query.message.reply_text(ArabicUtils.add_rtl("⏭️ تم تخطي السؤال."))
             await self.ask_question(update, context, session)
             return
@@ -537,7 +543,7 @@ class EducationalBot:
         session.current_index += 1
         self.db.save_session(session)
 
-        # الرد على الرسالة الأصلية
+        # الرد على الرسالة الأصلية (سواء كانت زر أو نص)
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
         

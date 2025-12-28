@@ -35,17 +35,14 @@ logger = logging.getLogger("ProQuizBot")
 class Config:
     TOKEN = os.getenv("BOT_TOKEN", "").strip()
     
-    # 🚨 ضع رقم الآيدي حقك هنا مباشرة عشان يشتغل الأدمن 🚨
-    # مثال: ADMIN_IDS = {290185541}
+    # معرفات الأدمن (Admin IDs)
     ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-    
-    # إضافة الآيدي من المتغيرات أو يدوياً هنا
     if os.getenv("ADMIN_USER_ID"):
         if os.getenv("ADMIN_USER_ID").strip().isdigit():
             ADMIN_IDS.add(int(os.getenv("ADMIN_USER_ID")))
     
-    # للتجربة: إذا ما ضبطت المتغيرات، الغِ التعليق عن السطر التالي وضع رقمك:
-    # ADMIN_IDS.add(290185541)
+    # 🚨 هام: إذا كنت تجرب محلياً، يمكنك إضافة رقمك هنا مباشرة:
+    # ADMIN_IDS.add(123456789)
 
     DB_FILE = os.getenv("DB_FILE", "data.db")
     QUESTIONS_FILE = os.getenv("QUESTIONS_FILE", "questions_from_word.json")
@@ -60,7 +57,7 @@ class Config:
     BAR_EMPTY = "⬜"
 
 if not Config.TOKEN:
-    # Config.TOKEN = "YOUR_TOKEN_HERE" # احتياط
+    # Config.TOKEN = "PUT_YOUR_TOKEN_HERE_IF_NOT_USING_ENV"
     pass
 
 # =========================
@@ -124,6 +121,11 @@ class DatabaseManager:
                 conn.execute("INSERT INTO users(user_id, created_at, updated_at) VALUES (?,?,?)", (user_id, now, now))
             else:
                 conn.execute("UPDATE users SET updated_at=? WHERE user_id=?", (now, user_id))
+    
+    # ✅ دالة جديدة لجلب كل المستخدمين للإذاعة
+    def get_all_users(self):
+        with self._connect() as conn:
+            return [row['user_id'] for row in conn.execute("SELECT user_id FROM users")]
 
     def set_pending_name(self, user_id: int, name: str):
         now = datetime.utcnow().isoformat()
@@ -507,7 +509,7 @@ async def game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # الاحتفال المتحرك
         if is_correct and session.streak > 0 and session.streak % 3 == 0:
             try:
-                # 🎆 ستيكر ألعاب نارية
+                # 🎆 ستيكر ألعاب نارية (يظهر ويختفي)
                 msg = await context.bot.send_message(chat_id, "🎆")
                 await asyncio.sleep(2.5)
                 await msg.delete()
@@ -564,7 +566,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
 # =========================
-# 👮‍♂️ لوحة تحكم الأدمن (جديد)
+# 👮‍♂️ لوحة تحكم الأدمن + الإذاعة 📢
 # =========================
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -577,7 +579,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👮‍♂️ **لوحة التحكم**\n\n"
         f"👥 المستخدمين: {stats['users']}\n"
         f"🎮 الجولات الملعوبة: {stats['rounds']}\n"
-        f"⏳ طلبات الانتظار: {stats['pending']}\n"
+        f"⏳ طلبات الانتظار: {stats['pending']}\n\n"
+        f"💡 للإرسال للجميع استخدم:\n`/broadcast رسالتك`"
     )
     
     kb_rows = [
@@ -587,6 +590,45 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb_rows.insert(0, [InlineKeyboardButton(f"📋 عرض الطلبات المعلقة ({stats['pending']})", callback_data="admin_show_pending")])
         
     await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode="Markdown")
+
+# --- ميزة الإرسال الجماعي (Broadcast) ---
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in Config.ADMIN_IDS:
+        return # تجاهل
+
+    # قراءة الرسالة من بعد الأمر
+    message_to_send = " ".join(context.args)
+    if not message_to_send:
+        await update.message.reply_text(
+            "⚠️ **طريقة الاستخدام:**\n"
+            "/broadcast اكتب رسالتك هنا\n\n"
+            "مثال:\n`/broadcast السلام عليكم، رجعنا لكم بتحديث جديد! 🔥`",
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text("⏳ **جاري الإرسال للجميع...**")
+    
+    all_users = db.get_all_users()
+    success = 0
+    blocked = 0
+    
+    for uid in all_users:
+        try:
+            # إضافة ترويسة بسيطة
+            final_msg = f"📢 **إشعار إداري**\n\n{message_to_send}"
+            await context.bot.send_message(chat_id=uid, text=final_msg, parse_mode="Markdown")
+            success += 1
+            await asyncio.sleep(0.05) # تأخير لتجنب الحظر
+        except Exception:
+            blocked += 1
+
+    await update.message.reply_text(
+        f"✅ **تم الانتهاء!**\n\n"
+        f"📨 تم الإرسال لـ: {success}\n"
+        f"🚫 فشل الإرسال لـ: {blocked} (حظر/مشكلة)"
+    )
 
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -602,7 +644,8 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👮‍♂️ **لوحة التحكم**\n\n"
             f"👥 المستخدمين: {stats['users']}\n"
             f"🎮 الجولات الملعوبة: {stats['rounds']}\n"
-            f"⏳ طلبات الانتظار: {stats['pending']}\n"
+            f"⏳ طلبات الانتظار: {stats['pending']}\n\n"
+            f"💡 للإرسال للجميع استخدم:\n`/broadcast رسالتك`"
         )
         kb_rows = [[InlineKeyboardButton("🔄 تحديث", callback_data="admin_refresh")]]
         if stats['pending'] > 0:
@@ -626,7 +669,6 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(user_id, f"📝 **طلب معلق**\n👤: {p['full_name']}\n🆔: `{p['user_id']}`", parse_mode="Markdown", reply_markup=kb)
         return
 
-    # معالجة القبول والرفض
     if data.startswith("adm_"):
         action, target_id = data.split(":")
         target_id = int(target_id)
@@ -649,8 +691,12 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(Config.TOKEN).build()
     
+    # أوامر عامة
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_command)) # ✅ تمت إضافة أمر الأدمن
+    
+    # أوامر الأدمن
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command)) # ✅ تمت الإضافة
     
     app.add_handler(CallbackQueryHandler(menu_handler, pattern="^menu_"))
     app.add_handler(CallbackQueryHandler(admin_handler, pattern="^(adm_|admin_)"))

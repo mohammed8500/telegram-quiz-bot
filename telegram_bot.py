@@ -3,11 +3,11 @@ import os
 import re
 import random
 import sqlite3
-import html
 from difflib import SequenceMatcher
-from typing import Dict, Any, Optional, List, Set, Tuple
+from typing import Dict, Any, Optional, List, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -20,8 +20,8 @@ from telegram.ext import (
 # =========================
 # إعدادات
 # =========================
-QUESTIONS_FILE = "questions_from_word.json"
-DB_FILE = "bot_state.db"
+QUESTIONS_FILE = os.getenv("QUESTIONS_FILE", "questions_from_word.json")
+DB_FILE = os.getenv("DB_FILE", "bot_state.db")
 
 # ضع التوكن في Railway كـ Variable باسم BOT_TOKEN
 TOKEN = os.getenv("BOT_TOKEN", "")
@@ -90,139 +90,43 @@ def save_user_state(user_id: int, state: Dict[str, Any]) -> None:
         con.close()
 
 # =========================
-# أدوات تنسيق + مطابقة مصطلحات
+# أدوات
 # =========================
-_AR_DIACRITICS_RE = re.compile(r"[\u0617-\u061A\u064B-\u0652]")
-_NON_TEXT_RE = re.compile(r"[^\u0600-\u06FF0-9A-Za-z\s]")
-
 def normalize_arabic(text: str) -> str:
     if not text:
         return ""
-    text = _AR_DIACRITICS_RE.sub("", text)  # تشكيل
+    text = re.sub(r"[\u0617-\u061A\u064B-\u0652]", "", text)  # تشكيل
     text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
     text = text.replace("ى", "ي").replace("ة", "ه").replace("ؤ", "و").replace("ئ", "ي")
-    text = text.replace("ـ", "")
-    text = _NON_TEXT_RE.sub(" ", text)
+    text = re.sub(r"[^\u0600-\u06FF0-9A-Za-z\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip().lower()
     return text
 
-def _strip_al_prefix_token(token: str) -> str:
-    if token.startswith("ال") and len(token) > 2:
-        stripped = token[2:]
-        return stripped if stripped else token
-    return token
-
-def normalize_term_variants(text: str) -> Set[str]:
-    base = normalize_arabic(text)
-    if not base:
-        return set()
-    tokens = base.split()
-    no_al_tokens = [_strip_al_prefix_token(t) for t in tokens]
-    v1 = " ".join(tokens).strip()
-    v2 = " ".join(no_al_tokens).strip()
-    variants = {v1}
-    if v2:
-        variants.add(v2)
-    if len(tokens) == 1:
-        variants.add(_strip_al_prefix_token(tokens[0]))
-    return {v for v in variants if v}
-
 def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
-
-def smart_term_match(user_answer: str, correct_answer: str) -> Tuple[bool, float]:
-    user_vars = normalize_term_variants(user_answer)
-    corr_vars = normalize_term_variants(correct_answer)
-
-    if not user_vars or not corr_vars:
-        return False, 0.0
-
-    # 1) تطابق مباشر
-    for ua in user_vars:
-        for ca in corr_vars:
-            if ua == ca:
-                return True, 1.0
-
-    # 2) احتواء بسيط
-    for ua in user_vars:
-        for ca in corr_vars:
-            if ua in ca or ca in ua:
-                if abs(len(ua) - len(ca)) <= 2:
-                    return True, 0.95
-
-    # 3) Fuzzy
-    best = 0.0
-    for ua in user_vars:
-        for ca in corr_vars:
-            best = max(best, similarity(ua, ca))
-
-    max_len = max(max(len(x) for x in user_vars), max(len(x) for x in corr_vars))
-    if max_len <= 4:
-        thr = 0.95
-    elif max_len <= 7:
-        thr = 0.90
-    else:
-        thr = 0.85
-
-    return best >= thr, best
 
 def sorted_mcq_keys(keys: List[str]) -> List[str]:
     order = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
     return sorted(keys, key=lambda k: order.get(k, 999))
 
-def progress_bar(current_index_1based: int, total: int, length: int = 10) -> str:
-    if total <= 0:
-        return ""
-    ratio = current_index_1based / total
-    filled = int(round(ratio * length))
-    filled = max(0, min(length, filled))
-    return "▰" * filled + "▱" * (length - filled)
-
 def esc(s: str) -> str:
-    return html.escape(s or "")
-
-def help_text_for(q: Dict[str, Any]) -> str:
-    qtype = q.get("type")
-    if qtype == "mcq":
-        return (
-            "ℹ️ <b>مساعدة</b>\n"
-            "• اضغط على حرف الإجابة من الأزرار.\n"
-            "• تقدر تضغط <b>⏭️ تخطي</b> لو تبغى.\n"
-            "• اكتب <code>/stats</code> تشوف نتيجتك.\n"
-            "• اكتب <code>/reset</code> عشان بنك جديد."
-        )
-    if qtype == "tf":
-        return (
-            "ℹ️ <b>مساعدة</b>\n"
-            "• اختر: <b>صح</b> أو <b>خطأ</b> من الأزرار.\n"
-            "• تقدر تضغط <b>⏭️ تخطي</b>.\n"
-            "• <code>/stats</code> للنتيجة."
-        )
-    # short_answer
-    return (
-        "ℹ️ <b>مساعدة</b>\n"
-        "• اكتب المصطلح في رسالة وحدة.\n"
-        "• إذا كتبت <b>تقنية</b> بدل <b>التقنية</b> تُحسب صح ✅\n"
-        "• لا تشيل هم الهمزات/التشكيل—البوت يتساهل فيها.\n"
-        "• تقدر تضغط <b>⏭️ تخطي</b>."
-    )
-
-def main_menu_text() -> str:
-    return (
-        "هلااا 😄👋\n"
-        "أنا بوت أسئلة علوم ثاني متوسط ✨\n\n"
-        "🚀 <b>/quiz</b> ابدأ الاختبار\n"
-        "📊 <b>/stats</b> شوف نتيجتك\n"
-        "♻️ <b>/reset</b> بنك جديد\n\n"
-        "يلا ورّنا شطارتك يا بطّطل 🔥"
-    )
+    """Escape for HTML parse_mode."""
+    if s is None:
+        return ""
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;"))
 
 # =========================
-# تحميل الأسئلة من JSON
+# تحميل الأسئلة (Lazy) عشان ما يطيّح البوت لو الملف ناقص
 # =========================
-def load_questions() -> List[Dict[str, Any]]:
+QUESTIONS: List[Dict[str, Any]] = []
+QMAP: Dict[str, Dict[str, Any]] = {}
+QUESTIONS_STATUS: Tuple[bool, str] = (False, "Not loaded yet")
+
+def load_questions_from_json() -> List[Dict[str, Any]]:
     if not os.path.exists(QUESTIONS_FILE):
-        raise FileNotFoundError(f"ما لقيت {QUESTIONS_FILE} بنفس مجلد البوت.")
+        raise FileNotFoundError(f"ما لقيت ملف الأسئلة: {QUESTIONS_FILE}")
 
     with open(QUESTIONS_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -244,7 +148,7 @@ def load_questions() -> List[Dict[str, Any]]:
             options = it.get("options") or {}
             correct_key = it.get("correct")
             converted.append({
-                "id": qid,
+                "id": str(qid),
                 "type": "mcq",
                 "question": (it.get("question") or "").strip(),
                 "options": options,
@@ -256,7 +160,7 @@ def load_questions() -> List[Dict[str, Any]]:
             ans = it.get("answer")
             correct_key = "صح" if ans is True else "خطأ" if ans is False else None
             converted.append({
-                "id": qid,
+                "id": str(qid),
                 "type": "tf",
                 "question": (it.get("statement") or "").strip(),
                 "options": {"صح": "صح", "خطأ": "خطأ"},
@@ -266,7 +170,7 @@ def load_questions() -> List[Dict[str, Any]]:
 
         elif t == "term":
             converted.append({
-                "id": qid,
+                "id": str(qid),
                 "type": "short_answer",
                 "question": (it.get("definition") or "").strip(),
                 "correct": (it.get("term") or "").strip(),
@@ -274,13 +178,63 @@ def load_questions() -> List[Dict[str, Any]]:
 
     return converted
 
-QUESTIONS = load_questions()
-QMAP = {q["id"]: q for q in QUESTIONS}
+def ensure_questions_loaded() -> bool:
+    global QUESTIONS, QMAP, QUESTIONS_STATUS
+    if QUESTIONS_STATUS[0]:
+        return True
+    try:
+        q = load_questions_from_json()
+        QUESTIONS = q
+        QMAP = {item["id"]: item for item in QUESTIONS}
+        QUESTIONS_STATUS = (True, f"Loaded {len(QUESTIONS)} questions")
+        return True
+    except Exception as e:
+        QUESTIONS = []
+        QMAP = {}
+        QUESTIONS_STATUS = (False, str(e))
+        return False
+
+# =========================
+# واجهة (أزرار) - القائمة الرئيسية
+# =========================
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    kb = [
+        [
+            InlineKeyboardButton("🚀 ابدأ الاختبار", callback_data="menu|quiz"),
+            InlineKeyboardButton("📊 نتيجتي", callback_data="menu|stats"),
+        ],
+        [
+            InlineKeyboardButton("♻️ بنك جديد", callback_data="menu|reset"),
+            InlineKeyboardButton("❓ مساعدة", callback_data="menu|help"),
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def question_footer(st: Dict[str, Any]) -> str:
+    score = int(st.get("score", 0) or 0)
+    answered = int(st.get("answered", 0) or 0)
+    return f"📌 <b>الصحيح:</b> {score} | <b>المجاوب:</b> {answered}"
+
+def help_text() -> str:
+    return (
+        "❓ <b>طريقة استخدام البوت</b>\n\n"
+        "• اضغط <b>🚀 ابدأ الاختبار</b> عشان يطلع لك سؤال.\n"
+        "• جاوب من الأزرار (اختيار/صح-خطأ).\n"
+        "• أسئلة المصطلحات: اكتب الإجابة برسالة.\n"
+        "• تقدر تضغط <b>⏭️ تخطي</b> لو تبي تعدّي.\n\n"
+        "🧠 <b>أوامر سريعة</b>\n"
+        "/quiz — يبدأ الاختبار\n"
+        "/stats — يطلع نتيجتك\n"
+        "/reset — بنك جديد\n"
+        "/help — المساعدة\n\n"
+        "✅ الميزة الحلوة: لو كتبت (تقنية) بدل (التقنية) غالبًا يحسبها صح 👌"
+    )
 
 # =========================
 # حالة المستخدم
 # =========================
 def new_state() -> Dict[str, Any]:
+    ensure_questions_loaded()
     order = [q["id"] for q in QUESTIONS]
     random.shuffle(order)
     return {
@@ -303,6 +257,8 @@ def set_state(user_id: int, st: Dict[str, Any]) -> None:
     save_user_state(user_id, st)
 
 def get_current_q(st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ensure_questions_loaded()
+
     order = st.get("order", [])
     idx = int(st.get("idx", 0) or 0)
 
@@ -314,28 +270,32 @@ def get_current_q(st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     return QMAP.get(order[idx])
 
-def build_common_buttons(qid: str) -> List[List[InlineKeyboardButton]]:
-    return [
-        [
-            InlineKeyboardButton("ℹ️ مساعدة", callback_data=f"help|{qid}"),
-            InlineKeyboardButton("⏭️ تخطي", callback_data=f"skip|{qid}"),
-        ]
-    ]
-
+# =========================
+# إرسال السؤال
+# =========================
 async def send_next_question(update: Update, user_id: int, st: Dict[str, Any]):
-    q = get_current_q(st)
+    ok = ensure_questions_loaded()
     target = update.message if update.message else update.callback_query.message
 
-    total = len(st.get("order", [])) or 0
-    current_1based = min(int(st.get("idx", 0) or 0) + 1, total if total else 1)
-    bar = progress_bar(current_1based, total, length=10)
+    if not ok:
+        await target.reply_text(
+            "❌ ما قدرت أحمل الأسئلة.\n"
+            f"السبب: {QUESTIONS_STATUS[1]}\n\n"
+            "✅ تأكد إن ملف الأسئلة موجود في الريبو باسم:\n"
+            f"<code>{esc(QUESTIONS_FILE)}</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    q = get_current_q(st)
 
     if not q:
         await target.reply_text(
-            f"🎉 <b>خلصت الاختبار!</b>\n\n"
-            f"📊 <b>نتيجتك:</b> {st['score']} / {st['answered']}\n"
-            f"♻️ اكتب <code>/reset</code> لو تبغى بنك جديد",
-            parse_mode="HTML",
+            "🎉 <b>خلصت الاختبار!</b>\n\n"
+            f"📊 <b>نتيجتك:</b> {int(st['score'])} / {int(st['answered'])}\n\n"
+            "تبغى تبدأ بنك جديد؟ اضغط ♻️ أو اكتب /reset",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
         )
         return
 
@@ -343,55 +303,73 @@ async def send_next_question(update: Update, user_id: int, st: Dict[str, Any]):
     st["expecting_text"] = (q.get("type") == "short_answer")
     set_state(user_id, st)
 
-    header = (
-        f"🧠 <b>سؤال {current_1based} من {total}</b>\n"
-        f"{bar}\n\n"
-    )
+    idx = int(st.get("idx", 0) or 0)
+    total = len(st.get("order", [])) or 1
 
+    header = f"🧩 <b>سؤال {idx+1}</b> / {total}\n"
     qtext = esc((q.get("question") or "").strip())
     qtype = q.get("type")
+
+    # أزرار ثابتة تحت كل سؤال
+    def bottom_buttons(qid: str) -> List[List[InlineKeyboardButton]]:
+        return [
+            [
+                InlineKeyboardButton("⏭️ تخطي", callback_data=f"skip|{qid}"),
+                InlineKeyboardButton("❓ مساعدة", callback_data="menu|help"),
+                InlineKeyboardButton("🏠 القائمة", callback_data="menu|home"),
+            ]
+        ]
 
     if qtype in ("mcq", "tf"):
         options: Dict[str, str] = q.get("options") or {}
 
         if qtype == "tf":
             keys = ["صح", "خطأ"]
-            text = header + f"❓ <b>{qtext}</b>\n\nاختر الإجابة:"
+            body = f"{header}{qtext}\n\n🟣 <b>اختر الإجابة:</b>\n\n{question_footer(st)}"
         else:
             keys = sorted_mcq_keys(list(options.keys()))
-            lines = [header + f"❓ <b>{qtext}</b>\n"]
+            lines = [f"{header}{qtext}", "", "🟣 <b>اختر الإجابة:</b>", ""]
             for k in keys:
-                lines.append(f"• <b>{esc(k)})</b> {esc(options.get(k, ''))}")
-            lines.append("\nاختر الإجابة من الأزرار 👇")
-            text = "\n".join(lines)
+                lines.append(f"<b>{esc(k)})</b> {esc(options.get(k, ''))}")
+            lines.append("")
+            lines.append(question_footer(st))
+            body = "\n".join(lines)
 
         keyboard: List[List[InlineKeyboardButton]] = []
         row: List[InlineKeyboardButton] = []
         for k in keys:
-            row.append(InlineKeyboardButton(text=k, callback_data=f"ans|{q['id']}|{k}"))
+            row.append(InlineKeyboardButton(text=str(k), callback_data=f"ans|{q['id']}|{k}"))
             if len(row) == 4:
                 keyboard.append(row)
                 row = []
         if row:
             keyboard.append(row)
 
-        keyboard += build_common_buttons(q["id"])
+        keyboard += bottom_buttons(q["id"])
 
-        await target.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        await target.reply_text(
+            body,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
 
     if qtype == "short_answer":
-        text = (
-            header
-            + "✍️ <b>سؤال مصطلح/إجابة قصيرة</b>\n"
-            + f"❓ <b>{qtext}</b>\n\n"
-            + "اكتب الإجابة في رسالة وحدة 👇"
+        body = (
+            f"{header}✍️ <b>سؤال مصطلح / إجابة قصيرة</b>\n\n"
+            f"{qtext}\n\n"
+            "🟣 <b>اكتب الإجابة برسالة</b>\n\n"
+            f"{question_footer(st)}"
         )
-        keyboard = build_common_buttons(q["id"])
-        await target.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        await target.reply_text(
+            body,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(bottom_buttons(q["id"]))
+        )
         return
 
-    st["idx"] = int(st.get("idx", 0) or 0) + 1
+    # لو نوع غير معروف
+    st["idx"] = idx + 1
     set_state(user_id, st)
     await send_next_question(update, user_id, st)
 
@@ -399,9 +377,22 @@ async def send_next_question(update: Update, user_id: int, st: Dict[str, Any]):
 # أوامر
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    _ = get_state(user_id)
-    await update.message.reply_text(main_menu_text(), parse_mode="HTML")
+    ensure_questions_loaded()
+    await update.message.reply_text(
+        "هلااا 😄👋\n\n"
+        "أنا <b>بوت مراجعة الاختبار</b> ✨\n"
+        "أطلع لك أسئلة عشوائية + أحسب نتيجتك + أحاول أتفهم إجابة المصطلحات 👌\n\n"
+        "اضغط زر من تحت 👇",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard()
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        help_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard()
+    )
 
 async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -411,22 +402,29 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     st = get_state(user_id)
+    total = len(st.get("order", [])) or 0
+    idx = int(st.get("idx", 0) or 0)
     await update.message.reply_text(
-        f"📊 <b>إحصائياتك</b>\n\n"
-        f"✅ <b>الصحيح:</b> {st['score']}\n"
-        f"🧾 <b>المجاوب عليه:</b> {st['answered']}\n"
-        f"📍 <b>وصلت للسؤال:</b> {min(st['idx']+1, len(st['order']))} من {len(st['order'])}",
-        parse_mode="HTML",
+        "📊 <b>إحصائياتك</b>\n\n"
+        f"✅ <b>الصحيح:</b> {int(st.get('score', 0) or 0)}\n"
+        f"🧾 <b>المجاوب عليه:</b> {int(st.get('answered', 0) or 0)}\n"
+        f"📍 <b>وصلت:</b> {min(idx+1, total) if total else 0} / {total}\n",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard()
     )
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     st = new_state()
     set_state(user_id, st)
-    await update.message.reply_text("♻️ <b>تم إنشاء بنك جديد!</b>\nاكتب <code>/quiz</code> للبدء 😄", parse_mode="HTML")
+    await update.message.reply_text(
+        "♻️ <b>تم إنشاء بنك جديد!</b>\nاضغط 🚀 ابدأ الاختبار أو اكتب /quiz",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard()
+    )
 
 # =========================
-# أزرار: إجابة/تخطي/مساعدة
+# أزرار الإجابة + التخطي + القائمة
 # =========================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -439,55 +437,77 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split("|")
     action = parts[0] if parts else ""
 
-    if action == "help":
-        if len(parts) != 2:
+    # ---- قائمة / مساعدة ----
+    if action == "menu":
+        which = parts[1] if len(parts) > 1 else ""
+        if which == "help":
+            await query.message.reply_text(help_text(), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
             return
-        qid = parts[1]
-        q = QMAP.get(qid)
-        if not q:
-            await query.message.reply_text("ℹ️ ما لقيت السؤال. اكتب /quiz للمتابعة.", parse_mode="HTML")
+        if which == "home":
+            await query.message.reply_text("🏠 <b>القائمة الرئيسية</b>\nاختر اللي تبيه 👇", parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
             return
-        await query.message.reply_text(help_text_for(q), parse_mode="HTML")
-        return
+        if which == "quiz":
+            await send_next_question(update, user_id, st)
+            return
+        if which == "stats":
+            total = len(st.get("order", [])) or 0
+            idx = int(st.get("idx", 0) or 0)
+            await query.message.reply_text(
+                "📊 <b>إحصائياتك</b>\n\n"
+                f"✅ <b>الصحيح:</b> {int(st.get('score', 0) or 0)}\n"
+                f"🧾 <b>المجاوب عليه:</b> {int(st.get('answered', 0) or 0)}\n"
+                f"📍 <b>وصلت:</b> {min(idx+1, total) if total else 0} / {total}\n",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard()
+            )
+            return
+        if which == "reset":
+            st2 = new_state()
+            set_state(user_id, st2)
+            await query.message.reply_text(
+                "♻️ <b>تم إنشاء بنك جديد!</b>\nاضغط 🚀 ابدأ الاختبار أو اكتب /quiz",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard()
+            )
+            return
 
+    # ---- تخطي ----
     if action == "skip":
         st["idx"] = int(st.get("idx", 0) or 0) + 1
         st["expecting_text"] = False
         st["current_qid"] = None
         set_state(user_id, st)
-        await query.message.reply_text(pick(SKIP_PHRASES), parse_mode="HTML")
+        await query.message.reply_text(pick(SKIP_PHRASES))
         await send_next_question(update, user_id, st)
         return
 
+    # ---- إجابة اختيار/صح-خطأ ----
     if action != "ans" or len(parts) != 3:
         return
 
     _, qid, chosen_key = parts
+
     if st.get("current_qid") != qid:
-        await query.message.reply_text("⚠️ هذا سؤال قديم. اكتب <code>/quiz</code> للمتابعة.", parse_mode="HTML")
+        await query.message.reply_text("⚠️ هذا سؤال قديم. اضغط 🚀 ابدأ الاختبار أو اكتب /quiz.")
         return
 
+    ensure_questions_loaded()
     q = QMAP.get(qid)
     if not q:
+        await query.message.reply_text("⚠️ ما لقيت السؤال. جرّب /reset.")
         return
 
     st["answered"] = int(st.get("answered", 0) or 0) + 1
     correct_key = q.get("correct_key")
-    correct_text = esc(q.get("correct", ""))
+    correct_text = q.get("correct", "")
 
     if chosen_key == correct_key:
         st["score"] = int(st.get("score", 0) or 0) + 1
-        await query.message.reply_text(
-            f"{pick(PRAISE_CORRECT)} ✅\n"
-            f"🎯 <b>الإجابة:</b> {esc(correct_key)}) {correct_text}",
-            parse_mode="HTML",
-        )
+        msg = f"{pick(PRAISE_CORRECT)} ✅\n<b>الإجابة:</b> {esc(str(correct_key))}) {esc(str(correct_text))}"
     else:
-        await query.message.reply_text(
-            f"{pick(ENCOURAGE_WRONG)} ❌\n"
-            f"✅ <b>الصحيح:</b> {esc(correct_key)}) {correct_text}",
-            parse_mode="HTML",
-        )
+        msg = f"{pick(ENCOURAGE_WRONG)} ❌\n<b>الصحيح:</b> {esc(str(correct_key))}) {esc(str(correct_text))}"
+
+    await query.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     st["idx"] = int(st.get("idx", 0) or 0) + 1
     st["expecting_text"] = False
@@ -507,6 +527,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     qid = st.get("current_qid")
+    ensure_questions_loaded()
     q = QMAP.get(qid) if qid else None
     if not q or q.get("type") != "short_answer":
         st["expecting_text"] = False
@@ -516,22 +537,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_answer = (update.message.text or "").strip()
     correct = (q.get("correct") or "").strip()
 
-    ok, sim = smart_term_match(user_answer, correct)
+    a = normalize_arabic(user_answer)
+    b = normalize_arabic(correct)
+
+    # مطابقة ذكية:
+    # 1) تطابق تام بعد التنظيف
+    # 2) أو تطابق شبه كامل >= 0.85
+    ok = False
+    if a and a == b:
+        ok = True
+    elif a and b:
+        ok = similarity(a, b) >= 0.85
 
     st["answered"] = int(st.get("answered", 0) or 0) + 1
     if ok:
         st["score"] = int(st.get("score", 0) or 0) + 1
         await update.message.reply_text(
-            f"{pick(PRAISE_CORRECT)} ✅\n"
-            f"🎯 <b>الإجابة الصحيحة:</b> {esc(correct)}",
-            parse_mode="HTML",
+            f"{pick(PRAISE_CORRECT)} ✅\n<b>الإجابة:</b> {esc(correct)}",
+            parse_mode=ParseMode.HTML
         )
     else:
         await update.message.reply_text(
-            f"{pick(ENCOURAGE_WRONG)} ❌\n"
-            f"📝 <b>إجابتك:</b> {esc(user_answer)}\n"
-            f"✅ <b>الصحيح:</b> {esc(correct)}",
-            parse_mode="HTML",
+            f"{pick(ENCOURAGE_WRONG)} ❌\n<b>الصحيح:</b> {esc(correct)}",
+            parse_mode=ParseMode.HTML
         )
 
     st["idx"] = int(st.get("idx", 0) or 0) + 1
@@ -548,18 +576,24 @@ def main():
     if not TOKEN:
         raise RuntimeError("لازم تضيف BOT_TOKEN في Variables داخل Railway.")
 
+    # تأكد قاعدة البيانات
     db_connect().close()
 
-app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).build()
+
+    # Commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("reset", reset))
+
+    # Callbacks + text
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     print("✅ Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling()
 
 if __name__ == "__main__":
     main()

@@ -923,23 +923,20 @@ async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.
         context.user_data["round_correct"] += 1
         context.user_data["round_streak"] += 1
         context.user_data["round_chapter_correct"][chap] = context.user_data["round_chapter_correct"].get(chap, 0) + 1
+streak = context.user_data["round_streak"]
 
-        streak = context.user_data["round_streak"]
-        if streak % STREAK_BONUS_EVERY == 0:
-            context.user_data["round_bonus"] += 1
-            await context.bot.send_message(chat_id=chat_id, text="✅ صح! 🔥\n+1 بونص سلسلة (كل 3 صح = +1)", reply_markup=ReplyKeyboardRemove())
-        else:
-            await context.bot.send_message(chat_id=chat_id, text="✅ صح!", reply_markup=ReplyKeyboardRemove())
-    else:
-        context.user_data["round_streak"] = 0
-        await context.bot.send_message(chat_id=chat_id, text="❌ خطأ!", reply_markup=ReplyKeyboardRemove())
+if streak % STREAK_BONUS_EVERY == 0:
+    context.user_data["round_bonus"] += 1
+    await query.message.reply_text("✅ صح! 🔥\n+1 (كل 3 صح = +1)")
+else:
+    await query.message.reply_text("✅ صح!")
 
-    qid = q.get("id", "")
-    if qid:
-        mark_seen(user_id, qid)
+qid = q.get("id", "")
+if qid:
+    mark_seen(user_id, qid)
 
-    context.user_data["round_index"] = idx + 1
-    await send_next_question(chat_id, user_id, context)
+context.user_data["round_index"] = idx + 1
+await send_next_question(chat_id, user_id, context)
 
 async def finish_round(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, ended_by_user: bool):
     user = get_user(user_id)

@@ -344,10 +344,6 @@ def load_questions() -> List[Dict[str, Any]]:
     with open(QUESTIONS_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # دعم أكثر من شكل:
-    # 1) {"items":[...]}
-    # 2) [{"id":...}, ...]
-    # 3) {"questions":[...]}
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -506,9 +502,6 @@ def admin_pending_keyboard(user_id: int) -> InlineKeyboardMarkup:
 # Helpers
 # =========================
 def parse_tf_answer(raw: Any) -> Optional[bool]:
-    """
-    يقبل True/False أو "صح/خطأ" أو "true/false" أو 1/0
-    """
     if raw is None:
         return None
     if isinstance(raw, bool):
@@ -523,23 +516,31 @@ def parse_tf_answer(raw: Any) -> Optional[bool]:
         return False
     return None
 
-async def send_clean(update: Update, text: str, reply_markup=None, parse_mode: Optional[str] = None):
-    """
-    إرسال رسالة مع إزالة ReplyKeyboard نهائياً.
-    """
-    if update.message:
-        await update.message.reply_text(
-            text,
-            reply_markup=reply_markup if reply_markup is not None else ReplyKeyboardRemove(),
-            parse_mode=parse_mode
-        )
-    elif update.callback_query:
-        # غالباً نرسل كرسالة جديدة عشان ما نكسر أزرار الـ Inline
-        await update.callback_query.message.reply_text(
-            text,
-            reply_markup=reply_markup if reply_markup is not None else ReplyKeyboardRemove(),
-            parse_mode=parse_mode
-        )
+# =========================
+# Motivation phrases
+# =========================
+MOTIVATION_CORRECT = [
+    "🔥 بطل! كمل كذا!",
+    "👏 ممتاز!",
+    "💪 رهيب!",
+    "✅ صح عليك!",
+    "🌟 كفو!",
+    "🚀 يا سلام عليك!",
+]
+
+MOTIVATION_WRONG = [
+    "😅 بسيطة! الجاية صح إن شاء الله.",
+    "👀 ركّز شوي، تقدر!",
+    "💡 مو مشكلة، تعلمنا!",
+    "🔥 لا توقف! كمل!",
+    "😎 قدها وقدود!",
+]
+
+MOTIVATION_BONUS = [
+    "🏅 بونص! سلسلة نار 🔥",
+    "🎯 ممتاز! خذت بونص!",
+    "💥 كملت سلسلة الصح!",
+]
 
 # =========================
 # Handlers
@@ -561,12 +562,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "اختر من القائمة 👇"
     )
 
-    # إزالة أي ReplyKeyboard سابق
     await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
     await update.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # مسموح للأدمن حتى لو صيانة
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
@@ -731,12 +730,11 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
     context.user_data["current_q"] = q
 
     chap = q.get("_chapter", "—")
-    # ما نعرض اسم الفصل في السؤال، لكن نخليه للإحصائيات
     context.user_data["round_chapter_total"][chap] = context.user_data["round_chapter_total"].get(chap, 0) + 1
 
     header = f"📌 السؤال {idx+1}/{ROUND_SIZE}\n\n"
-
     t = q.get("type")
+
     if t == "mcq":
         question = (q.get("question") or "").strip()
         options = q.get("options") or {}
@@ -757,7 +755,6 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
         await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=ReplyKeyboardRemove())
         return
 
-    # fallback
     await context.bot.send_message(chat_id=chat_id, text="⚠️ نوع سؤال غير معروف… تخطيناه.", reply_markup=ReplyKeyboardRemove())
     context.user_data["round_index"] = idx + 1
     await send_next_question(chat_id, user_id, context)
@@ -808,15 +805,15 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ إجابة غير متوقعة.", reply_markup=ReplyKeyboardRemove())
         return
 
+    # (اختياري) إزالة أزرار السؤال السابق عشان ما ينضغط مرة ثانية
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
     await apply_answer_result(chat_id, user_id, context, is_correct)
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Router واحد للنصوص:
-    - إذا ينتظر اسم -> يعالجه
-    - إذا ينتظر إجابة مصطلح -> يعالجه
-    - غير كذا: يتجاهل (أو ينبه)
-    """
     if await maintenance_block(update, context):
         return
 
@@ -849,7 +846,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove()
         )
 
-        # notify admins
         if ADMIN_IDS:
             for admin_id in ADMIN_IDS:
                 try:
@@ -885,58 +881,47 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await apply_answer_result(chat_id, user_id, context, is_correct)
         return
 
-    # 3) أي كلام خارج السياق
-    # نخليها خفيفة بدون إزعاج
     return
-# =========================
-# Motivation phrases
-# =========================
-MOTIVATION_CORRECT = [
-    "🔥 بطل! كمل كذا!",
-    "👏 ممتاز!",
-    "💪 رهيب!",
-    "✅ صح عليك!",
-    "🌟 كفو!",
-    "🚀 يا سلام عليك!",
-]
 
-MOTIVATION_WRONG = [
-    "😅 بسيطة! الجاية صح إن شاء الله.",
-    "👀 ركّز شوي، تقدر!",
-    "💡 مو مشكلة، تعلمنا!",
-    "🔥 لا توقف! كمل!",
-    "😎 قدها وقدود!",
-]
-
-MOTIVATION_BONUS = [
-    "🏅 بونص! سلسلة نار 🔥",
-    "🎯 ممتاز! خذت بونص!",
-    "💥 كملت سلسلة الصح!",
-]
+# =========================
+# ✅ FIXED: apply_answer_result
+# =========================
 async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, is_correct: bool):
-    idx = context.user_data.get("round_index", 0)
+    idx = int(context.user_data.get("round_index", 0))
     q = context.user_data.get("current_q") or {}
     chap = q.get("_chapter", "—")
 
+    bonus_hit = False
+
     if is_correct:
-        context.user_data["round_score"] += 1
-        context.user_data["round_correct"] += 1
-        context.user_data["round_streak"] += 1
+        context.user_data["round_score"] = int(context.user_data.get("round_score", 0)) + 1
+        context.user_data["round_correct"] = int(context.user_data.get("round_correct", 0)) + 1
+        context.user_data["round_streak"] = int(context.user_data.get("round_streak", 0)) + 1
         context.user_data["round_chapter_correct"][chap] = context.user_data["round_chapter_correct"].get(chap, 0) + 1
-streak = context.user_data["round_streak"]
 
-if streak % STREAK_BONUS_EVERY == 0:
-    context.user_data["round_bonus"] += 1
-    await query.message.reply_text("✅ صح! 🔥\n+1 (كل 3 صح = +1)")
-else:
-    await query.message.reply_text("✅ صح!")
+        streak = int(context.user_data["round_streak"])
+        if streak % STREAK_BONUS_EVERY == 0:
+            context.user_data["round_bonus"] = int(context.user_data.get("round_bonus", 0)) + 1
+            bonus_hit = True
 
-qid = q.get("id", "")
-if qid:
-    mark_seen(user_id, qid)
+        msg = f"✅ صح! {random.choice(MOTIVATION_CORRECT)}"
+        if bonus_hit:
+            msg += f"\n{random.choice(MOTIVATION_BONUS)} (+1 بونص)"
+        await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=ReplyKeyboardRemove())
 
-context.user_data["round_index"] = idx + 1
-await send_next_question(chat_id, user_id, context)
+    else:
+        context.user_data["round_streak"] = 0
+        msg = f"❌ خطأ! {random.choice(MOTIVATION_WRONG)}"
+        await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=ReplyKeyboardRemove())
+
+    # علّم السؤال كمشاهد
+    qid = q.get("id", "")
+    if qid:
+        mark_seen(user_id, qid)
+
+    # التالي
+    context.user_data["round_index"] = idx + 1
+    await send_next_question(chat_id, user_id, context)
 
 async def finish_round(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, ended_by_user: bool):
     user = get_user(user_id)
@@ -978,7 +963,12 @@ async def finish_round(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
     ]:
         context.user_data.pop(k, None)
 
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
 
     upsert_user(user_id)
     user = get_user(user_id)
@@ -1023,7 +1013,7 @@ def main():
     app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^(ans_mcq:|ans_tf:|end_round)"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(play_round|leaderboard|my_stats|set_name)$"))
 
-    # Text messages (Router واحد يحل مشكلة التعارض)
+    # Text messages
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
 
     logger.info("Bot started.")

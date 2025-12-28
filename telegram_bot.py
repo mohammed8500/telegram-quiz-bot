@@ -35,8 +35,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# إعدادات البوت والملفات
 CONFIG = {
-    "TOKEN": os.getenv("BOT_TOKEN", ""), 
+    "TOKEN": os.getenv("BOT_TOKEN", ""), # ضع التوكين هنا أو في متغيرات البيئة
     "QUESTIONS_FILE": "questions_from_word.json",
     "DB_FILE": "bot_state.db"
 }
@@ -45,29 +46,48 @@ CONFIG = {
 # 2. أدوات اللغة العربية
 # =========================
 class ArabicUtils:
-    RLM = "\u200F"
+    """أدوات لمعالجة النصوص العربية وضبط الاتجاه"""
+    
+    RLM = "\u200F"  # علامة محاذاة النص لليمين
 
     @staticmethod
     def add_rtl(text: str) -> str:
+        """إضافة علامة RTL لضمان ظهور النص من اليمين لليسار"""
         if not text: return ""
         return "\n".join([f"{ArabicUtils.RLM}{line}" for line in text.split('\n')])
 
     @staticmethod
     def normalize(text: str) -> str:
-        if not text: return ""
+        """تطبيع النص (إزالة التشكيل، توحيد الأحرف) للمقارنة"""
+        if not text:
+            return ""
+        
         text = text.strip()
+        # إزالة التشكيل والتطويل
         text = re.sub(r'[\u0617-\u061A\u064B-\u0652\u0640]', '', text)
+        # توحيد الألف
         text = re.sub(r'[أإآ]', 'ا', text)
-        text = text.replace('ى', 'ي').replace('ة', 'ه')
+        # توحيد الياء والألف المقصورة
+        text = text.replace('ى', 'ي')
+        # توحيد التاء المربوطة
+        text = text.replace('ة', 'ه')
+        # إزالة الرموز
         text = re.sub(r'[^\w\s]', ' ', text)
+        
         return re.sub(r'\s+', ' ', text).strip().lower()
 
     @staticmethod
     def smart_compare(user_answer: str, correct_answer: str) -> bool:
+        """مقارنة ذكية للإجابات النصية"""
         norm_user = ArabicUtils.normalize(user_answer)
         norm_correct = ArabicUtils.normalize(correct_answer)
-        if norm_user == norm_correct: return True
-        if len(norm_correct.split()) == 1 and norm_correct in norm_user: return True
+
+        if norm_user == norm_correct:
+            return True
+
+        if len(norm_correct.split()) == 1 and norm_correct in norm_user:
+            return True
+
         similarity = SequenceMatcher(None, norm_user, norm_correct).ratio()
         return similarity >= 0.85
 
@@ -75,11 +95,15 @@ class ArabicUtils:
 # 3. النصوص والهوية (اللهجة السعودية)
 # =========================
 class GameAssets:
+    """يحتوي على النصوص والعبارات باللهجة السعودية"""
+    
+    # القائمة الرئيسية
     BTN_START = "🚀 ابدأ التحدي"
     BTN_STATS = "📊 وش سويت؟"
     BTN_RESET = "♻️ بنك جديد"
     BTN_HELP  = "💡 الفزعة"
     
+    # رسالة الترحيب (الافتتاحية المطلوبة)
     WELCOME_MSG = """
 يا مرحبا ترحيبة البدو للعيد ⛺✨
 حي الله عالِم المستقبل 🎓
@@ -95,13 +119,14 @@ class GameAssets:
 💡 *كيف تستخدم البوت؟*
 
 • اضغط *ابدأ التحدي* عشان نطب في الأسئلة.
-• في الأسئلة المقالية، اكتب الإجابة وأرسلها.
+• في الأسئلة المقالية، اكتب الإجابة وأرسلها (بدون فلسفة زايدة 😉).
 • إذا توهقت، اضغط *تخطي*.
 • شيك على درجاتك من زر *وش سويت؟*.
 
 بالتوفيق يا ذيبان! 🌟
 """
 
+    # عبارات المدح
     PRAISE_PHRASES = [
         "كفووو! جبتها صح يا ذيبان 🐺",
         "يا أسطورة! ما فيك حيلة 👑",
@@ -115,6 +140,7 @@ class GameAssets:
         "عز الله إنك دافور! استمر 🤓"
     ]
 
+    # عبارات المواساة والتشجيع
     ENCOURAGE_PHRASES = [
         "معوض خير! الجايات أكثر من الرايحات 👋",
         "عوافي يا بطل، كل دقة بتعليمة 📚",
@@ -350,7 +376,7 @@ class EducationalBot:
 
     async def ask_question(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: UserSession):
         if session.current_index >= len(session.question_order):
-            await self.finish_quiz(update, session)
+            await self.finish_quiz(update, context, session)
             return
 
         q_id = session.question_order[session.current_index]
@@ -394,18 +420,13 @@ class EducationalBot:
 
         keyboard.append([InlineKeyboardButton("⏭️ تخطي السؤال", callback_data="skip")])
         
-        # دائماً نرسل رسالة جديدة للسؤال القادم، لكي يبقى القديم في الدردشة
-        if update.callback_query:
-            # إذا كان جاي من زر، نرسل في نفس الشات
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=msg_text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
-        else:
-            # إذا كان جاي من رسالة نصية
-            await update.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        # دائماً نرسل رسالة جديدة لضمان بقاء السجل
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=msg_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -421,11 +442,18 @@ class EducationalBot:
 
         if data == "skip":
             # إزالة الأزرار من السؤال الذي تم تخطيه
-            await query.message.edit_reply_markup(reply_markup=None)
-            
+            try:
+                await query.message.edit_reply_markup(reply_markup=None)
+            except:
+                pass
+
             session.current_index += 1
             self.db.save_session(session)
+            
+            # الرد على رسالة السؤال بأنه تم التخطي
             await query.message.reply_text(ArabicUtils.add_rtl("⏭️ تم تخطي السؤال."))
+            
+            # إرسال السؤال التالي
             await self.ask_question(update, context, session)
             return
 
@@ -457,25 +485,32 @@ class EducationalBot:
             try:
                 await update.callback_query.message.edit_reply_markup(reply_markup=None)
             except Exception:
-                pass # في حال كانت الرسالة قديمة جداً أو محذوفة
+                pass 
 
         if is_correct:
             session.score += 1
             feedback = random.choice(GameAssets.PRAISE_PHRASES)
-            msg = f"{feedback}\n✅ الإجابة صحيحة!"
+            msg = f"✅ *إجابة صحيحة!*\n{feedback}"
         else:
             feedback = random.choice(GameAssets.ENCOURAGE_PHRASES)
-            msg = f"{feedback}\n📌 الصواب هو: *{question.correct_text}*"
+            msg = f"""
+❌ *إجابة خاطئة!*
+
+✅ الإجابة الصحيحة هي:
+*{question.correct_text}*
+
+💡 {feedback}
+""".strip()
 
         session.is_waiting_text = False
         session.current_index += 1
         self.db.save_session(session)
 
-        # إرسال النتيجة كرد على السؤال (لتبقى في التاريخ)
-        # نستخدم send_message مع reply_to_message_id لعمل Reply
+        # تحديد الرسالة للرد عليها
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
         
+        # إرسال النتيجة كرد على السؤال
         await context.bot.send_message(
             chat_id=chat_id,
             text=ArabicUtils.add_rtl(msg),
@@ -486,7 +521,7 @@ class EducationalBot:
         # إرسال السؤال التالي
         await self.ask_question(update, context, session)
 
-    async def finish_quiz(self, update: Update, session: UserSession):
+    async def finish_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: UserSession):
         total = len(session.question_order)
         if total == 0: total = 1
         percent = (session.score / total) * 100
@@ -505,7 +540,6 @@ class EducationalBot:
 
 اضغط *بنك جديد* عشان تبدأ من جديد!
 """
-        # إرسال رسالة النهاية
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=ArabicUtils.add_rtl(final_msg),
@@ -521,7 +555,7 @@ class EducationalBot:
 
 if __name__ == "__main__":
     if not CONFIG["TOKEN"]:
-        print("⚠️ تنبيه: لم يتم العثور على التوكين.")
+        print("⚠️ تنبيه: لم يتم العثور على التوكين. تأكد من وضعه في الكود أو متغيرات البيئة.")
     
     bot = EducationalBot()
     bot.run()

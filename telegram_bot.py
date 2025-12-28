@@ -888,7 +888,31 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3) أي كلام خارج السياق
     # نخليها خفيفة بدون إزعاج
     return
+# =========================
+# Motivation phrases
+# =========================
+MOTIVATION_CORRECT = [
+    "🔥 بطل! كمل كذا!",
+    "👏 ممتاز!",
+    "💪 رهيب!",
+    "✅ صح عليك!",
+    "🌟 كفو!",
+    "🚀 يا سلام عليك!",
+]
 
+MOTIVATION_WRONG = [
+    "😅 بسيطة! الجاية صح إن شاء الله.",
+    "👀 ركّز شوي، تقدر!",
+    "💡 مو مشكلة، تعلمنا!",
+    "🔥 لا توقف! كمل!",
+    "😎 قدها وقدود!",
+]
+
+MOTIVATION_BONUS = [
+    "🏅 بونص! سلسلة نار 🔥",
+    "🎯 ممتاز! خذت بونص!",
+    "💥 كملت سلسلة الصح!",
+]
 async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, is_correct: bool):
     idx = context.user_data.get("round_index", 0)
     q = context.user_data.get("current_q") or {}

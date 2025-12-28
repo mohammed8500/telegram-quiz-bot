@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 
 # إعدادات البوت والملفات
 CONFIG = {
-    "TOKEN": os.getenv("BOT_TOKEN", ""), # ضع التوكين هنا أو في متغيرات البيئة
+    # ضع التوكين هنا بين علامتي التنصيص
+    "TOKEN": os.getenv("BOT_TOKEN", ""), 
     "QUESTIONS_FILE": "questions_from_word.json",
     "DB_FILE": "bot_state.db"
 }
@@ -122,6 +123,7 @@ class GameAssets:
 • في الأسئلة المقالية، اكتب الإجابة وأرسلها (بدون فلسفة زايدة 😉).
 • إذا توهقت، اضغط *تخطي*.
 • شيك على درجاتك من زر *وش سويت؟*.
+• المشرف يقدر يشوف العدد بالأمر /admin
 
 بالتوفيق يا ذيبان! 🌟
 """
@@ -290,6 +292,25 @@ class Database:
                 except:
                     return None
             return None
+    
+    def get_stats(self) -> Tuple[int, int]:
+        """ترجع (عدد المستخدمين الكلي, عدد من اختبروا فعلياً)"""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT data FROM sessions")
+            rows = cur.fetchall()
+            
+        total_users = len(rows)
+        active_users = 0
+        
+        for row in rows:
+            try:
+                data = json.loads(row[0])
+                if data.get('answered_count', 0) > 0:
+                    active_users += 1
+            except:
+                pass
+                
+        return total_users, active_users
 
 # =========================
 # 6. البوت ومنطق اللعبة
@@ -305,6 +326,8 @@ class EducationalBot:
     def register_handlers(self):
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CommandHandler("help", self.cmd_help))
+        self.app.add_handler(CommandHandler("admin", self.cmd_admin)) # الأمر الجديد
+        
         self.app.add_handler(MessageHandler(filters.Regex(f"^{GameAssets.BTN_START}$"), self.action_start_quiz))
         self.app.add_handler(MessageHandler(filters.Regex(f"^{GameAssets.BTN_STATS}$"), self.action_stats))
         self.app.add_handler(MessageHandler(filters.Regex(f"^{GameAssets.BTN_RESET}$"), self.action_reset))
@@ -330,6 +353,19 @@ class EducationalBot:
             ArabicUtils.add_rtl(GameAssets.HELP_MSG), 
             parse_mode="Markdown"
         )
+
+    async def cmd_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # لعرض الإحصائيات
+        total, active = self.db.get_stats()
+        msg = f"""
+👮‍♂️ *لوحة المشرف*
+────────────────
+👥 عدد الطلاب (الدخول): {total}
+📝 الطلاب المتفاعلين: {active}
+💤 الطلاب الخاملين: {total - active}
+────────────────
+"""
+        await update.message.reply_text(ArabicUtils.add_rtl(msg), parse_mode="Markdown")
 
     async def action_start_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -420,7 +456,7 @@ class EducationalBot:
 
         keyboard.append([InlineKeyboardButton("⏭️ تخطي السؤال", callback_data="skip")])
         
-        # دائماً نرسل رسالة جديدة لضمان بقاء السجل
+        # نرسل السؤال كرسالة جديدة دائماً للحفاظ على السجل
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=msg_text,
@@ -441,7 +477,6 @@ class EducationalBot:
             return
 
         if data == "skip":
-            # إزالة الأزرار من السؤال الذي تم تخطيه
             try:
                 await query.message.edit_reply_markup(reply_markup=None)
             except:
@@ -449,11 +484,7 @@ class EducationalBot:
 
             session.current_index += 1
             self.db.save_session(session)
-            
-            # الرد على رسالة السؤال بأنه تم التخطي
             await query.message.reply_text(ArabicUtils.add_rtl("⏭️ تم تخطي السؤال."))
-            
-            # إرسال السؤال التالي
             await self.ask_question(update, context, session)
             return
 
@@ -480,7 +511,7 @@ class EducationalBot:
     async def process_answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: UserSession, question: Question, is_correct: bool):
         session.answered_count += 1
         
-        # إزالة الأزرار من السؤال السابق (تجميده)
+        # إزالة الأزرار من السؤال السابق
         if update.callback_query:
             try:
                 await update.callback_query.message.edit_reply_markup(reply_markup=None)
@@ -490,7 +521,7 @@ class EducationalBot:
         if is_correct:
             session.score += 1
             feedback = random.choice(GameAssets.PRAISE_PHRASES)
-            msg = f"✅ *إجابة صحيحة!*\n{feedback}"
+            msg = f"✅ *إجابة صحيحة!*\n\n{feedback}"
         else:
             feedback = random.choice(GameAssets.ENCOURAGE_PHRASES)
             msg = f"""
@@ -506,11 +537,10 @@ class EducationalBot:
         session.current_index += 1
         self.db.save_session(session)
 
-        # تحديد الرسالة للرد عليها
+        # الرد على الرسالة الأصلية
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
         
-        # إرسال النتيجة كرد على السؤال
         await context.bot.send_message(
             chat_id=chat_id,
             text=ArabicUtils.add_rtl(msg),
@@ -518,7 +548,6 @@ class EducationalBot:
             reply_to_message_id=message_id
         )
 
-        # إرسال السؤال التالي
         await self.ask_question(update, context, session)
 
     async def finish_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: UserSession):

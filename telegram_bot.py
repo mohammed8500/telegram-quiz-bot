@@ -963,7 +963,7 @@ async def send_next_question(query, context: ContextTypes.DEFAULT_TYPE):
     chap = q.get("_chapter", "—")
     context.user_data["round_chapter_total"][chap] = context.user_data["round_chapter_total"].get(chap, 0) + 1
 
-    header = f"🧩 الفصل: {chap}\n📌 السؤال {idx+1}/{ROUND_SIZE}\n\n"
+    header = f"📌 السؤال {idx+1}/{ROUND_SIZE}\n\n"
 
     if q.get("type") == "mcq":
         question = (q.get("question") or "").strip()

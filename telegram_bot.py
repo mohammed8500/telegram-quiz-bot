@@ -908,7 +908,8 @@ def main():
         items = []
     buckets = build_chapter_buckets(items) if items else None
 
-    # زيادة المهلة في HTTPXRequest نفسه
+    # 1) زيادة المهلة (Timeout) لتجنب TimedOut
+    # لاحظ أننا نستخدم 60 ثانية لتكون كافية على Railway
     request = HTTPXRequest(
         connect_timeout=60.0,
         read_timeout=60.0,
@@ -916,7 +917,8 @@ def main():
         pool_timeout=60.0,
     )
 
-    # إزالة get_updates_read_timeout لمنع التعارض
+    # 2) استخدام request فقط بدون تكرار get_updates_read_timeout
+    # (هنا كان الخطأ السابق الذي سبب RuntimeError)
     app = Application.builder() \
         .token(BOT_TOKEN) \
         .request(request) \
@@ -944,7 +946,7 @@ def main():
 
     logger.info("Bot started. Admins=%s Maintenance=%s", sorted(list(ADMIN_IDS)), MAINTENANCE_ON)
 
-    # إعدادات Polling نظيفة
+    # 3) تشغيل البوت بطريقة نظيفة بدون Warning
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES

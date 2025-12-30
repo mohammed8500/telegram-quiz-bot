@@ -908,7 +908,7 @@ def main():
         items = []
     buckets = build_chapter_buckets(items) if items else None
 
-    # 1) Increase timeouts to 60s to prevent TimedOut on Railway
+    # زيادة المهلة في HTTPXRequest نفسه
     request = HTTPXRequest(
         connect_timeout=60.0,
         read_timeout=60.0,
@@ -916,11 +916,10 @@ def main():
         pool_timeout=60.0,
     )
 
-    # 2) Use get_updates_read_timeout in the builder
+    # إزالة get_updates_read_timeout لمنع التعارض
     app = Application.builder() \
         .token(BOT_TOKEN) \
         .request(request) \
-        .get_updates_read_timeout(60.0) \
         .build()
 
     app.bot_data["questions_items"] = items
@@ -945,7 +944,7 @@ def main():
 
     logger.info("Bot started. Admins=%s Maintenance=%s", sorted(list(ADMIN_IDS)), MAINTENANCE_ON)
 
-    # 3) Clean run_polling (removed deprecated timeouts)
+    # إعدادات Polling نظيفة
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES

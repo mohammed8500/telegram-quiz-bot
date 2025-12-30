@@ -664,7 +664,11 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
     if idx >= len(qs):
         await finish_round(chat_id, user_id, context, ended_by_user=False)
         return
-    q = qs[idx]
+    
+    # Take a shallow copy so we can modify it for "term" options without affecting the global list
+    original_q = qs[idx]
+    q = original_q.copy()
+    
     context.user_data["current_q"] = q
     chap = q.get("_chapter", "—")
     context.user_data["round_chapter_total"][chap] = context.user_data["round_chapter_total"].get(chap, 0) + 1
@@ -677,17 +681,52 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
         text = header + f"❓ {question}"
         await safe_send(context.bot, chat_id, text, reply_markup=answer_keyboard_mcq(options))
         return
+
     if t == "tf":
         st = (q.get("statement") or "").strip()
         text = header + f"✅/❌ {st}"
         await safe_send(context.bot, chat_id, text, reply_markup=answer_keyboard_tf())
         return
+
+    # 🔥 تعديل جذري: تحويل المصطلحات إلى اختيارات
     if t == "term":
         definition = (q.get("definition") or "").strip()
-        text = header + "🧠 اكتب المصطلح المناسب للتعريف التالي:\n\n" + f"📘 {definition}\n\n✍️ اكتب الإجابة:"
-        context.user_data["awaiting_term_answer"] = True
-        await safe_send(context.bot, chat_id, text, reply_markup=ReplyKeyboardRemove())
+        correct_term = (q.get("term") or "").strip()
+        
+        # نجمع مصطلحات خطأ عشوائية من القائمة الكاملة
+        all_terms = context.bot_data.get("all_terms", [])
+        # نحذف الإجابة الصحيحة من القائمة
+        distractors = [x for x in all_terms if x != correct_term]
+        
+        # نختار 3 عشوائي
+        if len(distractors) >= 3:
+            random_picks = random.sample(distractors, 3)
+        else:
+            random_picks = distractors # fallback logic
+
+        # ندمج الصحيحة مع الخطأ ونخلطهم
+        choices = [correct_term] + random_picks
+        random.shuffle(choices)
+
+        # ننشئ خيارات A, B, C, D
+        options_map = {}
+        keys = ["A", "B", "C", "D"]
+        correct_key = ""
+
+        for i, choice in enumerate(choices):
+            key = keys[i]
+            options_map[key] = choice
+            if choice == correct_term:
+                correct_key = key
+        
+        # نخزن الخيارات في السؤال الحالي عشان نقدر نتحقق منها في answer_callback
+        q["options"] = options_map
+        q["correct"] = correct_key  # نخدع الكود ليتعامل معه كأنه MCQ
+
+        text = header + "🧠 ما هو المصطلح المناسب للتعريف التالي؟\n\n" + f"📘 {definition}"
+        await safe_send(context.bot, chat_id, text, reply_markup=answer_keyboard_mcq(options_map))
         return
+
     await safe_send(context.bot, chat_id, "⚠️ نوع سؤال غير معروف… تخطيناه.", reply_markup=ReplyKeyboardRemove())
     context.user_data["round_index"] = idx + 1
     await send_next_question(chat_id, user_id, context)
@@ -712,10 +751,13 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     is_correct = False
     t = q.get("type")
-    if t == "mcq" and data.startswith("ans_mcq:"):
+    
+    # نتعامل مع MCQ و term بنفس الطريقة الآن
+    if (t == "mcq" or t == "term") and data.startswith("ans_mcq:"):
         picked = data.split(":")[1]
         correct = (q.get("correct") or "").strip().upper()
         is_correct = (picked == correct)
+    
     elif t == "tf" and data.startswith("ans_tf:"):
         picked = data.split(":")[1]
         correct_bool = parse_tf_answer(q.get("answer"))
@@ -768,23 +810,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.warning("Failed notifying admin %s: %s", admin_id, e)
         return
-
-    if context.user_data.get("awaiting_term_answer"):
-        if "round_questions" not in context.user_data:
-            context.user_data["awaiting_term_answer"] = False
-            return
-        q = context.user_data.get("current_q")
-        if not q or q.get("type") != "term":
-            context.user_data["awaiting_term_answer"] = False
-            return
-        user_answer = normalize_arabic(text)
-        correct_term = normalize_arabic(q.get("term") or "")
-        def strip_al(s: str) -> str:
-            return re.sub(r"^ال", "", s)
-        is_correct = (user_answer == correct_term) or (strip_al(user_answer) == strip_al(correct_term))
-        context.user_data["awaiting_term_answer"] = False
-        await apply_answer_result(chat_id, user_id, context, is_correct)
-        return
+    
+    # ألغينا التحقق من نص المصطلحات لأنها صارت اختيارات
     return
 
 # =========================
@@ -815,6 +842,7 @@ async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.
     idx = context.user_data.get("round_index", 0)
     q = context.user_data.get("current_q") or {}
     chap = q.get("_chapter", "—")
+    
     if is_correct:
         context.user_data["round_score"] += 1
         context.user_data["round_correct"] += 1
@@ -828,9 +856,25 @@ async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.
             msg = "✅ صح! " + random.choice(MOTIVATION_CORRECT)
         await safe_send(context.bot, chat_id, msg, reply_markup=ReplyKeyboardRemove())
     else:
+        # 🔥 هنا نضيف عرض الإجابة الصحيحة عند الخطأ
         context.user_data["round_streak"] = 0
-        msg = "❌ خطأ! " + random.choice(MOTIVATION_WRONG)
-        await safe_send(context.bot, chat_id, msg, reply_markup=ReplyKeyboardRemove())
+        
+        correct_text = "—"
+        t = q.get("type")
+        
+        if t in ["mcq", "term"]:
+            # نجيب نص الخيار الصحيح من الـ options
+            c_key = q.get("correct")
+            opts = q.get("options", {})
+            correct_text = opts.get(c_key, "غير معروف")
+        elif t == "tf":
+            c_bool = parse_tf_answer(q.get("answer") or q.get("correct"))
+            correct_text = "✅ صح" if c_bool else "❌ خطأ"
+            
+        msg = f"❌ خطأ! {random.choice(MOTIVATION_WRONG)}\n\n✅ الإجابة الصحيحة كانت: **{correct_text}**"
+        
+        await safe_send(context.bot, chat_id, msg, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    
     qid = q.get("id", "")
     if qid:
         mark_seen(user_id, qid)
@@ -907,9 +951,17 @@ def main():
         logger.exception("Failed loading questions file: %s", e)
         items = []
     buckets = build_chapter_buckets(items) if items else None
+    
+    # 🆕 نجمع كل المصطلحات عشان نستخدمها كخيارات خطأ
+    all_terms_set = set()
+    for it in items:
+        if it.get("type") == "term":
+            val = it.get("term")
+            if val:
+                all_terms_set.add(val.strip())
+    all_terms_list = list(all_terms_set)
 
     # 1) زيادة المهلة (Timeout) لتجنب TimedOut
-    # لاحظ أننا نستخدم 60 ثانية لتكون كافية على Railway
     request = HTTPXRequest(
         connect_timeout=60.0,
         read_timeout=60.0,
@@ -917,8 +969,7 @@ def main():
         pool_timeout=60.0,
     )
 
-    # 2) استخدام request فقط بدون تكرار get_updates_read_timeout
-    # (هنا كان الخطأ السابق الذي سبب RuntimeError)
+    # 2) استخدام request فقط
     app = Application.builder() \
         .token(BOT_TOKEN) \
         .request(request) \
@@ -926,6 +977,8 @@ def main():
 
     app.bot_data["questions_items"] = items
     app.bot_data["questions_buckets"] = buckets
+    # نخزن المصطلحات هنا
+    app.bot_data["all_terms"] = all_terms_list
 
     # Commands
     app.add_handler(CommandHandler("start", start))
@@ -946,7 +999,7 @@ def main():
 
     logger.info("Bot started. Admins=%s Maintenance=%s", sorted(list(ADMIN_IDS)), MAINTENANCE_ON)
 
-    # 3) تشغيل البوت بطريقة نظيفة بدون Warning
+    # 3) تشغيل البوت
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES

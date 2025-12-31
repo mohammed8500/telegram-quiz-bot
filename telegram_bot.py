@@ -30,18 +30,10 @@ from telegram.ext import (
 # Logging محسن
 # =========================
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - [User:%(user_id)s] - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger("telegram-quiz-bot")
-
-# إضافة فلتر لإضافة user_id للسجلات
-class UserFilter(logging.Filter):
-    def filter(self, record):
-        record.user_id = getattr(record, 'user_id', 'Unknown')
-        return True
-
-logger.addFilter(UserFilter())
 
 # =========================
 # Configuration
@@ -629,11 +621,12 @@ question_manager = QuestionManager()
 # =========================
 # Session Cleanup Task
 # =========================
-async def cleanup_task(app: Application):
+async def cleanup_task():
     """مهمة تنظيف الجلسات القديمة"""
     while True:
         try:
             await asyncio.sleep(CLEANUP_INTERVAL)
+            
             cutoff = datetime.utcnow() - timedelta(seconds=MAX_ROUND_DURATION)
             cutoff_str = cutoff.isoformat()
             
@@ -665,17 +658,10 @@ async def cleanup_task(app: Application):
                         
                         logger.info(f"Cleaned up old round for user {row['user_id']}")
                     except Exception as e:
-                        logger.error(f"Error cleaning round for user {row['user_id']}: {e}")
+                        logger.error(f"Error cleaning round: {e}")
                 
                 # حذف الجولات النشطة القديمة
                 cur.execute("DELETE FROM active_rounds WHERE last_activity < ?", (cutoff_str,))
-                
-                # تحديث المستخدمين غير النشطين
-                cur.execute("""
-                    UPDATE users 
-                    SET last_active = updated_at 
-                    WHERE last_active IS NULL
-                """)
             
             logger.info("Cleanup task completed")
             
@@ -797,7 +783,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     
     # إضافة user_id للسجلات
-    logger.info(f"User {user_id} started bot", extra={'user_id': user_id})
+    logger.info(f"User {user_id} started bot")
     
     msg = (
         "هلا 👋\n"
@@ -823,7 +809,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     data = query.data
     
-    logger.info(f"Menu callback: {data} from user {user_id}", extra={'user_id': user_id})
+    logger.info(f"Menu callback: {data} from user {user_id}")
     
     if data == "set_name":
         context.user_data["awaiting_name"] = True
@@ -1007,7 +993,7 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
         await send_next_question(chat_id, user_id, context)
         
     except Exception as e:
-        logger.error(f"Error in send_next_question: {e}", extra={'user_id': user_id})
+        logger.error(f"Error in send_next_question: {e}")
         await safe_send(context.bot, chat_id, "⚠️ حدث خطأ في تحميل السؤال. حاول مرة أخرى.", reply_markup=ReplyKeyboardRemove())
 
 async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1128,7 +1114,7 @@ async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.
         await send_next_question(chat_id, user_id, context)
         
     except Exception as e:
-        logger.error(f"Error in apply_answer_result: {e}", extra={'user_id': user_id})
+        logger.error(f"Error in apply_answer_result: {e}")
         await safe_send(context.bot, chat_id, "⚠️ حدث خطأ في معالجة إجابتك. حاول مرة أخرى.", reply_markup=ReplyKeyboardRemove())
 
 async def finish_round(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, ended_by_user: bool):
@@ -1178,7 +1164,7 @@ async def finish_round(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
         )
         
     except Exception as e:
-        logger.error(f"Error in finish_round: {e}", extra={'user_id': user_id})
+        logger.error(f"Error in finish_round: {e}")
         await safe_send(
             context.bot,
             chat_id,
@@ -1383,7 +1369,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             logger.error(f"Error in error handler: {e}")
 
 # =========================
-# Main
+# Main - بدون job_queue
 # =========================
 def main():
     """الدالة الرئيسية لتشغيل البوت"""
@@ -1433,21 +1419,50 @@ def main():
     # Error handler
     app.add_error_handler(error_handler)
     
-    # بدء مهمة التنظيف
-    app.job_queue.run_once(
-        lambda ctx: asyncio.create_task(cleanup_task(app)),
-        when=5
-    )
+    # بدء مهمة التنظيف في thread منفصل
+    def start_cleanup_thread():
+        """بدء مهمة التنظيف في thread منفصل"""
+        try:
+            # إنشاء loop جديد
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # تشغيل مهمة التنظيف
+            cleanup_coro = cleanup_task()
+            
+            # إذا كان هناك حدث loop بالفعل، استخدمه
+            try:
+                loop.run_until_complete(cleanup_coro)
+            except RuntimeError:
+                # إذا كان هناك loop نشط بالفعل، أنشئ task جديد
+                asyncio.create_task(cleanup_coro)
+        except Exception as e:
+            logger.error(f"Failed to start cleanup thread: {e}")
     
-    # تشغيل البوت مع إعدادات مثالية للثبات
-    logger.info("Starting bot with improved stability settings...")
+    # استيراد threading لتشغيل التنظيف في thread منفصل
+    import threading
     
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-        poll_interval=0.5,  # ليست سريعة جداً ولا بطيئة جداً
-        close_loop=False
-    )
+    # بدء thread التنظيف
+    cleanup_thread = threading.Thread(target=start_cleanup_thread, daemon=True)
+    cleanup_thread.start()
+    
+    logger.info("Cleanup thread started")
+    
+    # تشغيل البوت
+    logger.info("Starting bot...")
+    
+    try:
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            poll_interval=0.5,
+            close_loop=False
+        )
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        raise
 
 if __name__ == "__main__":
     main()

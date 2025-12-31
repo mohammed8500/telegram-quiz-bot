@@ -80,7 +80,7 @@ CHAPTERS = [
 ]
 
 # =========================
-# Robust send helpers
+# Robust send helpers (FAST VERSION)
 # =========================
 SEND_RETRIES = 3
 
@@ -89,12 +89,15 @@ async def safe_send(bot, chat_id: int, text: str, **kwargs):
         try:
             return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
         except RetryAfter as e:
-            wait = int(getattr(e, "retry_after", 2))
+            # احترام وقت الانتظار الإجباري من تيليجرام
+            wait = int(getattr(e, "retry_after", 1))
             logger.warning("RetryAfter: sleeping %ss", wait)
             await asyncio.sleep(wait)
         except (TimedOut, NetworkError) as e:
+            # 🔥 تعديل للسرعة: تقليل وقت الانتظار عند الخطأ
+            # بدلاً من الانتظار الطويل، ننتظر نصف ثانية فقط ونحاول مجدداً
             logger.warning("Send failed (attempt %s/%s): %s", attempt, SEND_RETRIES, e)
-            await asyncio.sleep(min(2 * attempt, 6))
+            await asyncio.sleep(0.5) 
     logger.error("Send permanently failed after retries.")
     return None
 
@@ -999,10 +1002,11 @@ def main():
 
     logger.info("Bot started. Admins=%s Maintenance=%s", sorted(list(ADMIN_IDS)), MAINTENANCE_ON)
 
-    # 3) تشغيل البوت
+    # 3) 🔥 تعديل للسرعة: ضبط poll_interval لصفر ليكون أسرع ما يمكن
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
+        allowed_updates=Update.ALL_TYPES,
+        poll_interval=0.0
     )
 
 if __name__ == "__main__":

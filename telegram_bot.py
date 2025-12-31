@@ -5,8 +5,9 @@ import logging
 import re
 import sqlite3
 import asyncio
-from datetime import datetime
-from typing import Dict, List, Any, Optional
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Set
+from contextlib import contextmanager
 
 from telegram import (
     Update,
@@ -14,7 +15,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-from telegram.error import TimedOut, NetworkError, RetryAfter
+from telegram.error import TimedOut, NetworkError, RetryAfter, BadRequest
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -26,24 +27,30 @@ from telegram.ext import (
 )
 
 # =========================
-# Logging
+# Logging محسن
 # =========================
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - [User:%(user_id)s] - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger("telegram-quiz-bot")
 
+# إضافة فلتر لإضافة user_id للسجلات
+class UserFilter(logging.Filter):
+    def filter(self, record):
+        record.user_id = getattr(record, 'user_id', 'Unknown')
+        return True
+
+logger.addFilter(UserFilter())
+
 # =========================
-# ENV
+# Configuration
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in Railway Variables.")
 
-# Admin IDs:
 ADMIN_IDS = set()
-
 _admin_single = os.getenv("ADMIN_USER_ID", "").strip()
 if _admin_single.isdigit():
     ADMIN_IDS.add(int(_admin_single))
@@ -55,21 +62,22 @@ if _admin_raw:
         if x.isdigit():
             ADMIN_IDS.add(int(x))
 
-# Maintenance mode
 MAINTENANCE_MODE = os.getenv("MAINTENANCE_MODE", "0").strip()
 MAINTENANCE_ON = MAINTENANCE_MODE in ("1", "true", "True", "YES", "yes", "on", "ON")
 
-# Optional bad words list
 BAD_WORDS = set(w.strip() for w in os.getenv("BAD_WORDS", "").split(",") if w.strip())
 
-# Files
 QUESTIONS_FILE = os.getenv("QUESTIONS_FILE", "questions_from_word.json").strip()
 DB_FILE = os.getenv("DB_FILE", "data.db").strip()
 
-# Game settings
+# =========================
+# Game Settings
+# =========================
 ROUND_SIZE = 20
 STREAK_BONUS_EVERY = 3
 TOP_N = 10
+MAX_ROUND_DURATION = 600  # 10 دقائق كحد أقصى للجولة
+CLEANUP_INTERVAL = 3600   # تنظيف كل ساعة
 
 CHAPTERS = [
     "طبيعة العلم",
@@ -80,29 +88,166 @@ CHAPTERS = [
 ]
 
 # =========================
-# Robust send helpers (FAST VERSION)
+# Database Connection Pooling
+# =========================
+class DatabaseManager:
+    """مدير اتصالات قاعدة البيانات مع connection pooling"""
+    
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._init_pool()
+        return cls._instance
+    
+    def _init_pool(self):
+        """تهيئة اتصال دائم مع إعدادات متقدمة"""
+        self.conn = sqlite3.connect(
+            DB_FILE,
+            check_same_thread=False,
+            timeout=30.0,
+            isolation_level=None
+        )
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA cache_size=10000")
+        self._init_tables()
+    
+    def _init_tables(self):
+        """تهيئة الجداول"""
+        cur = self.conn.cursor()
+        
+        # جدول المستخدمين
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                full_name TEXT,
+                is_approved INTEGER DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT,
+                total_points INTEGER DEFAULT 0,
+                rounds_played INTEGER DEFAULT 0,
+                best_round_score INTEGER DEFAULT 0,
+                last_active TEXT
+            )
+        """)
+        
+        # جدول طلبات الأسماء
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pending_names (
+                user_id INTEGER PRIMARY KEY,
+                full_name TEXT,
+                requested_at TEXT,
+                status TEXT DEFAULT 'pending'
+            )
+        """)
+        
+        # جدول الأسئلة المشاهدة
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS seen_questions (
+                user_id INTEGER,
+                qid TEXT,
+                seen_at TEXT,
+                PRIMARY KEY (user_id, qid)
+            )
+        """)
+        
+        # جدول الجولات
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS rounds (
+                round_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                started_at TEXT,
+                finished_at TEXT,
+                score INTEGER DEFAULT 0,
+                bonus INTEGER DEFAULT 0,
+                correct INTEGER DEFAULT 0,
+                total INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'completed'
+            )
+        """)
+        
+        # جدول الجولات النشطة
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS active_rounds (
+                user_id INTEGER PRIMARY KEY,
+                data TEXT,
+                started_at TEXT,
+                last_activity TEXT
+            )
+        """)
+        
+        self.conn.commit()
+    
+    @contextmanager
+    def get_cursor(self):
+        """الحصول على مؤشر للاستعلامات"""
+        cursor = self.conn.cursor()
+        try:
+            yield cursor
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def close(self):
+        """إغلاق الاتصال"""
+        if self.conn:
+            self.conn.close()
+
+db_manager = DatabaseManager()
+
+# =========================
+# Robust send helpers
 # =========================
 SEND_RETRIES = 3
+SEND_TIMEOUT = 10  # 10 ثواني كحد أقصى للإرسال
 
 async def safe_send(bot, chat_id: int, text: str, **kwargs):
+    """إرسال آمن مع إعادة المحاولة"""
     for attempt in range(1, SEND_RETRIES + 1):
         try:
-            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            # إضافة timeout صريح
+            return await asyncio.wait_for(
+                bot.send_message(chat_id=chat_id, text=text, **kwargs),
+                timeout=SEND_TIMEOUT
+            )
         except RetryAfter as e:
-            # احترام وقت الانتظار الإجباري من تيليجرام
-            wait = int(getattr(e, "retry_after", 1))
-            logger.warning("RetryAfter: sleeping %ss", wait)
-            await asyncio.sleep(wait)
-        except (TimedOut, NetworkError) as e:
-            # 🔥 تعديل للسرعة: تقليل وقت الانتظار عند الخطأ
-            # بدلاً من الانتظار الطويل، ننتظر نصف ثانية فقط ونحاول مجدداً
-            logger.warning("Send failed (attempt %s/%s): %s", attempt, SEND_RETRIES, e)
-            await asyncio.sleep(0.5) 
-    logger.error("Send permanently failed after retries.")
+            wait_time = getattr(e, 'retry_after', 1)
+            logger.warning(f"Rate limited, waiting {wait_time}s")
+            await asyncio.sleep(wait_time)
+        except (TimedOut, NetworkError, asyncio.TimeoutError) as e:
+            logger.warning(f"Network error (attempt {attempt}/{SEND_RETRIES}): {e}")
+            if attempt < SEND_RETRIES:
+                await asyncio.sleep(1 * attempt)  # زيادة الانتظار تدريجياً
+            else:
+                logger.error("Failed to send message after retries")
+                return None
+        except BadRequest as e:
+            logger.error(f"Bad request: {e}")
+            # لا نعيد المحاولة لأخطاء BadRequest
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error in safe_send: {e}")
+            if attempt == SEND_RETRIES:
+                return None
+            await asyncio.sleep(1)
+    
     return None
 
+async def safe_answer_callback(query, text: str = None, show_alert: bool = False):
+    """إجابة آمنة على callback queries"""
+    try:
+        await query.answer(text=text, show_alert=show_alert)
+    except Exception as e:
+        logger.warning(f"Failed to answer callback: {e}")
+
 # =========================
-# Arabic normalization helpers
+# Arabic normalization
 # =========================
 _ARABIC_DIACRITICS = re.compile(r"[\u064B-\u065F\u0670\u0640]")
 
@@ -115,7 +260,7 @@ def normalize_arabic(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
     text = text.replace("ى", "ي").replace("ة", "ه")
-    return text
+    return text.lower()
 
 def is_arabic_only_name(name: str) -> bool:
     if not name:
@@ -150,316 +295,432 @@ def is_admin(user_id: int) -> bool:
 async def maintenance_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not MAINTENANCE_ON:
         return False
+    
     user_id = update.effective_user.id if update.effective_user else 0
     if is_admin(user_id):
         return False
+    
     msg = "🛠️ البوت تحت صيانة حالياً… ارجعوا بعدين 🌿"
-    if update.message:
-        await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
-    elif update.callback_query:
-        await update.callback_query.answer("البوت تحت صيانة", show_alert=True)
-        try:
-            await update.callback_query.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
-        except Exception:
-            pass
+    
+    try:
+        if update.message:
+            await safe_send(context.bot, update.message.chat_id, msg, reply_markup=ReplyKeyboardRemove())
+        elif update.callback_query:
+            await safe_answer_callback(update.callback_query, "البوت تحت صيانة", show_alert=True)
+            await safe_send(context.bot, update.callback_query.message.chat_id, msg, reply_markup=ReplyKeyboardRemove())
+    except Exception as e:
+        logger.error(f"Maintenance block failed: {e}")
+    
     return True
 
 # =========================
-# DB
+# Database operations
 # =========================
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def db_init():
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            is_approved INTEGER DEFAULT 0,
-            created_at TEXT,
-            updated_at TEXT,
-            total_points INTEGER DEFAULT 0,
-            rounds_played INTEGER DEFAULT 0,
-            best_round_score INTEGER DEFAULT 0
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS pending_names (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            requested_at TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS seen_questions (
-            user_id INTEGER,
-            qid TEXT,
-            PRIMARY KEY (user_id, qid)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS rounds (
-            round_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            started_at TEXT,
-            finished_at TEXT,
-            score INTEGER DEFAULT 0,
-            bonus INTEGER DEFAULT 0,
-            correct INTEGER DEFAULT 0,
-            total INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
-
 def upsert_user(user_id: int):
+    """إضافة أو تحديث مستخدم مع تحديث وقت النشاط"""
     now = datetime.utcnow().isoformat()
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    if row is None:
-        cur.execute(
-            "INSERT INTO users(user_id, created_at, updated_at) VALUES (?,?,?)",
-            (user_id, now, now)
-        )
-    else:
-        cur.execute("UPDATE users SET updated_at=? WHERE user_id=?", (now, user_id))
-    conn.commit()
-    conn.close()
+    with db_manager.get_cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
+        if cur.fetchone():
+            cur.execute(
+                "UPDATE users SET updated_at=?, last_active=? WHERE user_id=?",
+                (now, now, user_id)
+            )
+        else:
+            cur.execute(
+                "INSERT INTO users(user_id, created_at, updated_at, last_active) VALUES (?,?,?,?)",
+                (user_id, now, now, now)
+            )
 
 def set_pending_name(user_id: int, full_name: str):
     now = datetime.utcnow().isoformat()
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO pending_names(user_id, full_name, requested_at)
-        VALUES(?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET full_name=excluded.full_name, requested_at=excluded.requested_at
-    """, (user_id, full_name, now))
-    conn.commit()
-    conn.close()
+    with db_manager.get_cursor() as cur:
+        cur.execute("""
+            INSERT INTO pending_names(user_id, full_name, requested_at)
+            VALUES(?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET 
+                full_name=excluded.full_name, 
+                requested_at=excluded.requested_at,
+                status='pending'
+        """, (user_id, full_name, now))
 
 def approve_name(user_id: int):
     now = datetime.utcnow().isoformat()
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT full_name FROM pending_names WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    if row:
-        full_name = row["full_name"]
-        cur.execute("""
-            UPDATE users SET full_name=?, is_approved=1, updated_at=?
-            WHERE user_id=?
-        """, (full_name, now, user_id))
-        cur.execute("DELETE FROM pending_names WHERE user_id=?", (user_id,))
-        conn.commit()
-    conn.close()
+    with db_manager.get_cursor() as cur:
+        cur.execute("SELECT full_name FROM pending_names WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        if row:
+            full_name = row["full_name"]
+            cur.execute("""
+                UPDATE users SET full_name=?, is_approved=1, updated_at=?
+                WHERE user_id=?
+            """, (full_name, now, user_id))
+            cur.execute("DELETE FROM pending_names WHERE user_id=?", (user_id,))
 
 def reject_name(user_id: int):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM pending_names WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
+    with db_manager.get_cursor() as cur:
+        cur.execute("DELETE FROM pending_names WHERE user_id=?", (user_id,))
 
 def get_user(user_id: int) -> Dict[str, Any]:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else {}
+    with db_manager.get_cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        return dict(row) if row else {}
 
 def get_pending_list() -> List[Dict[str, Any]]:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM pending_names ORDER BY requested_at ASC")
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with db_manager.get_cursor() as cur:
+        cur.execute("SELECT * FROM pending_names WHERE status='pending' ORDER BY requested_at ASC")
+        return [dict(row) for row in cur.fetchall()]
 
 def mark_seen(user_id: int, qid: str):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO seen_questions(user_id, qid) VALUES(?,?)", (user_id, qid))
-    conn.commit()
-    conn.close()
+    now = datetime.utcnow().isoformat()
+    with db_manager.get_cursor() as cur:
+        cur.execute("""
+            INSERT OR IGNORE INTO seen_questions(user_id, qid, seen_at)
+            VALUES(?,?,?)
+        """, (user_id, qid, now))
 
 def has_seen(user_id: int, qid: str) -> bool:
     if not qid:
         return False
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM seen_questions WHERE user_id=? AND qid=? LIMIT 1", (user_id, qid))
-    ok = cur.fetchone() is not None
-    conn.close()
-    return ok
+    with db_manager.get_cursor() as cur:
+        cur.execute("SELECT 1 FROM seen_questions WHERE user_id=? AND qid=? LIMIT 1", (user_id, qid))
+        return cur.fetchone() is not None
 
-def save_round_result(user_id: int, score: int, bonus: int, correct: int, total: int) -> None:
+def save_round_result(user_id: int, score: int, bonus: int, correct: int, total: int, status: str = "completed"):
     now = datetime.utcnow().isoformat()
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO rounds(user_id, started_at, finished_at, score, bonus, correct, total)
-        VALUES(?,?,?,?,?,?,?)
-    """, (user_id, now, now, score, bonus, correct, total))
-
-    cur.execute("SELECT total_points, rounds_played, best_round_score FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    if row:
-        total_points = int(row["total_points"]) + int(score + bonus)
-        rounds_played = int(row["rounds_played"]) + 1
-        best_round_score = max(int(row["best_round_score"]), int(score + bonus))
+    with db_manager.get_cursor() as cur:
         cur.execute("""
-            UPDATE users
-            SET total_points=?, rounds_played=?, best_round_score=?, updated_at=?
-            WHERE user_id=?
-        """, (total_points, rounds_played, best_round_score, now, user_id))
-    conn.commit()
-    conn.close()
+            INSERT INTO rounds(user_id, started_at, finished_at, score, bonus, correct, total, status)
+            VALUES(?,?,?,?,?,?,?,?)
+        """, (user_id, now, now, score, bonus, correct, total, status))
+
+        cur.execute("SELECT total_points, rounds_played, best_round_score FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        if row:
+            total_points = int(row["total_points"]) + int(score + bonus)
+            rounds_played = int(row["rounds_played"]) + 1
+            best_round_score = max(int(row["best_round_score"]), int(score + bonus))
+            cur.execute("""
+                UPDATE users
+                SET total_points=?, rounds_played=?, best_round_score=?, updated_at=?
+                WHERE user_id=?
+            """, (total_points, rounds_played, best_round_score, now, user_id))
+
+def save_active_round(user_id: int, round_data: Dict[str, Any]):
+    """حفظ جولة نشطة للاسترجاع عند فقدان الاتصال"""
+    now = datetime.utcnow().isoformat()
+    data_json = json.dumps(round_data, ensure_ascii=False)
+    with db_manager.get_cursor() as cur:
+        cur.execute("""
+            INSERT INTO active_rounds(user_id, data, started_at, last_activity)
+            VALUES(?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                data=excluded.data,
+                last_activity=excluded.last_activity
+        """, (user_id, data_json, now, now))
+
+def load_active_round(user_id: int) -> Optional[Dict[str, Any]]:
+    """تحميل جولة نشطة"""
+    with db_manager.get_cursor() as cur:
+        cur.execute("SELECT data FROM active_rounds WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        if row:
+            return json.loads(row["data"])
+    return None
+
+def delete_active_round(user_id: int):
+    """حذف جولة نشطة"""
+    with db_manager.get_cursor() as cur:
+        cur.execute("DELETE FROM active_rounds WHERE user_id=?", (user_id,))
 
 def get_leaderboard(top_n: int) -> List[Dict[str, Any]]:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT full_name, total_points, best_round_score, rounds_played
-        FROM users
-        WHERE is_approved=1 AND full_name IS NOT NULL AND TRIM(full_name) <> ''
-        ORDER BY total_points DESC, best_round_score DESC, rounds_played DESC
-        LIMIT ?
-    """, (top_n,))
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with db_manager.get_cursor() as cur:
+        cur.execute("""
+            SELECT full_name, total_points, best_round_score, rounds_played
+            FROM users
+            WHERE is_approved=1 AND full_name IS NOT NULL AND TRIM(full_name) <> ''
+            ORDER BY total_points DESC, best_round_score DESC, rounds_played DESC
+            LIMIT ?
+        """, (top_n,))
+        return [dict(row) for row in cur.fetchall()]
 
 # =========================
-# Questions load + chapter auto-classification
+# Question Manager with caching
 # =========================
-def load_questions() -> List[Dict[str, Any]]:
-    with open(QUESTIONS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        if isinstance(data.get("items"), list):
-            return data["items"]
-        if isinstance(data.get("questions"), list):
-            return data["questions"]
-    return []
+class QuestionManager:
+    def __init__(self):
+        self.items = []
+        self.buckets = {}
+        self.term_pool = []
+        self.last_loaded = None
+        self.load_questions()
+    
+    def load_questions(self):
+        """تحميل الأسئلة مع caching"""
+        try:
+            file_mtime = os.path.getmtime(QUESTIONS_FILE)
+            if self.last_loaded and file_mtime <= self.last_loaded:
+                return
+            
+            with open(QUESTIONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("items", []) or data.get("questions", [])
+            else:
+                items = []
+            
+            # إضافة IDs فريدة إن لم تكن موجودة
+            for i, item in enumerate(items):
+                if "id" not in item:
+                    item["id"] = f"q_{i}_{hash(str(item))}"
+            
+            self.items = items
+            self.buckets = self.build_chapter_buckets(items)
+            self.term_pool = self.extract_terms(items)
+            self.last_loaded = file_mtime
+            
+            logger.info(f"Loaded {len(items)} questions, {len(self.term_pool)} terms")
+            
+        except Exception as e:
+            logger.error(f"Failed to load questions: {e}")
+            self.items = []
+            self.buckets = {}
+            self.term_pool = []
+    
+    def build_chapter_buckets(self, items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        buckets = {c: [] for c in CHAPTERS}
+        for item in items:
+            chapter = self.classify_chapter(item)
+            item["_chapter"] = chapter
+            buckets[chapter].append(item)
+        return buckets
+    
+    def classify_chapter(self, item: Dict[str, Any]) -> str:
+        CHAPTER_KEYWORDS = {
+            "طبيعة العلم": ["الطريقه العلميه", "فرضيه", "متغير", "ثابت", "ملاحظه", "تجربه", "استنتاج", "تواصل", "علم الاثار", "الرادار"],
+            "المخاليط والمحاليل": ["مخلوط", "محلول", "مذيب", "مذاب", "تركيز", "ذائبيه", "حمض", "قاعده", "تعادل", "ترسب", "ph", "ايوني", "تساهمي"],
+            "حالات المادة": ["صلب", "سائل", "غاز", "بلازما", "انصهار", "تبخر", "تكاثف", "تجمد", "تسامي", "ضغط", "كثافه", "توتر سطحي", "لزوج"],
+            "الطاقة وتحولاتها": ["طاقه", "حركيه", "وضع", "كامنه", "اشعاعيه", "كيميائيه", "كهربائيه", "نوويه", "توربين", "مولد", "خليه شمسيه", "حفظ الطاقه"],
+            "أجهزة الجسم": ["دم", "قلب", "شريان", "وريد", "شعيره", "مناعه", "اجسام مضاده", "مولدات الضد", "ايدز", "سكري", "هضم", "معده", "امعاء", "رئه", "تنفس", "كليه", "بول"],
+        }
+        
+        blob = ""
+        t = item.get("type")
+        if t == "mcq":
+            blob = (item.get("question") or "")
+            options = item.get("options") or {}
+            blob += " " + " ".join(str(v) for v in options.values())
+        elif t == "tf":
+            blob = (item.get("statement") or "")
+        elif t == "term":
+            blob = (item.get("term") or "") + " " + (item.get("definition") or "")
+        
+        blob_n = normalize_arabic(blob)
+        best_chapter = "حالات المادة"
+        best_score = 0
+        
+        for chapter, keywords in CHAPTER_KEYWORDS.items():
+            score = 0
+            for kw in keywords:
+                if kw and normalize_arabic(kw) in blob_n:
+                    score += 1
+            if score > best_score:
+                best_score = score
+                best_chapter = chapter
+        
+        return best_chapter
+    
+    def extract_terms(self, items: List[Dict[str, Any]]) -> List[str]:
+        """استخراج جميع المصطلحات"""
+        terms = []
+        for item in items:
+            if item.get("type") == "term":
+                term = item.get("term")
+                if term and term.strip():
+                    terms.append(term.strip())
+        return list(set(terms))
+    
+    def pick_round_questions(self, user_id: int) -> List[Dict[str, Any]]:
+        """اختيار أسئلة الجولة مع تجنب التكرار"""
+        self.load_questions()  # تحديث إذا لزم الأمر
+        
+        if not self.buckets:
+            return []
+        
+        target_per_chapter = ROUND_SIZE // len(CHAPTERS)
+        chosen = []
+        seen_ids = set()
+        
+        # محاولة الحصول على أسئلة غير مشاهدة لكل فصل
+        for chapter in CHAPTERS:
+            pool = self.buckets.get(chapter, [])
+            unseen = [q for q in pool if not has_seen(user_id, q.get("id"))]
+            random.shuffle(unseen)
+            
+            take = min(target_per_chapter, len(unseen))
+            for q in unseen[:take]:
+                if q["id"] not in seen_ids:
+                    chosen.append(q)
+                    seen_ids.add(q["id"])
+        
+        # إذا لم نحصل على عدد كافٍ، نأتي بأسئلة إضافية
+        if len(chosen) < ROUND_SIZE:
+            all_questions = []
+            for chapter in CHAPTERS:
+                all_questions.extend(self.buckets.get(chapter, []))
+            
+            random.shuffle(all_questions)
+            for q in all_questions:
+                if q["id"] not in seen_ids:
+                    chosen.append(q)
+                    seen_ids.add(q["id"])
+                    if len(chosen) >= ROUND_SIZE:
+                        break
+        
+        # ضمان عدم تجاوز العدد المطلوب
+        chosen = chosen[:ROUND_SIZE]
+        random.shuffle(chosen)
+        return chosen
+    
+    def convert_term_to_mcq(self, term_question: Dict[str, Any]) -> Dict[str, Any]:
+        """تحويل سؤال المصطلح إلى MCQ"""
+        correct_term = term_question.get("term", "").strip()
+        definition = term_question.get("definition", "").strip()
+        
+        # اختيار 3 مصطلحات خاطئة عشوائية
+        wrong_terms = [t for t in self.term_pool if t != correct_term]
+        if len(wrong_terms) >= 3:
+            distractors = random.sample(wrong_terms, 3)
+        else:
+            # fallback: إنشاء مصطلحات وهمية إذا لم يكن هناك ما يكفي
+            distractors = ["مصطلح 1", "مصطلح 2", "مصطلح 3"]
+        
+        # خلط الخيارات
+        all_choices = [correct_term] + distractors
+        random.shuffle(all_choices)
+        
+        # إنشاء خيارات
+        options = {}
+        correct_key = None
+        for i, choice in enumerate(all_choices):
+            key = ["A", "B", "C", "D"][i]
+            options[key] = choice
+            if choice == correct_term:
+                correct_key = key
+        
+        # إنشاء سؤال MCQ جديد
+        mcq_question = term_question.copy()
+        mcq_question.update({
+            "type": "mcq",
+            "question": f"ما هو المصطلح المناسب للتعريف التالي؟\n\n{definition}",
+            "options": options,
+            "correct": correct_key,
+            "original_type": "term"  # للإشارة إلى أن هذا تم تحويله
+        })
+        
+        return mcq_question
 
-CHAPTER_KEYWORDS = {
-    "طبيعة العلم": ["الطريقه العلميه", "فرضيه", "متغير", "ثابت", "ملاحظه", "تجربه", "استنتاج", "تواصل", "علم الاثار", "الرادار"],
-    "المخاليط والمحاليل": ["مخلوط", "محلول", "مذيب", "مذاب", "تركيز", "ذائبيه", "حمض", "قاعده", "تعادل", "ترسب", "ph", "ايوني", "تساهمي"],
-    "حالات المادة": ["صلب", "سائل", "غاز", "بلازما", "انصهار", "تبخر", "تكاثف", "تجمد", "تسامي", "ضغط", "كثافه", "توتر سطحي", "لزوج"],
-    "الطاقة وتحولاتها": ["طاقه", "حركيه", "وضع", "كامنه", "اشعاعيه", "كيميائيه", "كهربائيه", "نوويه", "توربين", "مولد", "خليه شمسيه", "حفظ الطاقه"],
-    "أجهزة الجسم": ["دم", "قلب", "شريان", "وريد", "شعيره", "مناعه", "اجسام مضاده", "مولدات الضد", "ايدز", "سكري", "هضم", "معده", "امعاء", "رئه", "تنفس", "كليه", "بول"],
-}
-
-def classify_chapter(item: Dict[str, Any]) -> str:
-    blob = ""
-    t = item.get("type")
-    if t == "mcq":
-        blob = (item.get("question") or "")
-        options = item.get("options") or {}
-        blob += " " + " ".join(str(v) for v in options.values())
-    elif t == "tf":
-        blob = (item.get("statement") or "")
-    elif t == "term":
-        blob = (item.get("term") or "") + " " + (item.get("definition") or "")
-
-    blob_n = normalize_arabic(blob)
-    best = "حالات المادة"
-    best_score = 0
-    for chap, kws in CHAPTER_KEYWORDS.items():
-        score = 0
-        for kw in kws:
-            if kw and normalize_arabic(kw) in blob_n:
-                score += 1
-        if score > best_score:
-            best_score = score
-            best = chap
-    return best
-
-def build_chapter_buckets(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    buckets = {c: [] for c in CHAPTERS}
-    for it in items:
-        chap = classify_chapter(it)
-        it["_chapter"] = chap
-        buckets.get(chap, buckets["حالات المادة"]).append(it)
-    return buckets
-
-def pick_round_questions(user_id: int, buckets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    target_per_chapter = {c: ROUND_SIZE // len(CHAPTERS) for c in CHAPTERS}
-    chosen: List[Dict[str, Any]] = []
-    leftovers: List[Dict[str, Any]] = []
-
-    for chap in CHAPTERS:
-        pool = buckets.get(chap, [])
-        unseen = [q for q in pool if not has_seen(user_id, q.get("id", ""))]
-        random.shuffle(unseen)
-        take = target_per_chapter[chap]
-        taken = unseen[:take]
-        chosen.extend(taken)
-        leftovers.extend(unseen[take:])
-
-    if len(chosen) < ROUND_SIZE:
-        random.shuffle(leftovers)
-        need = ROUND_SIZE - len(chosen)
-        chosen.extend(leftovers[:need])
-
-    if len(chosen) < ROUND_SIZE:
-        all_items = []
-        for chap in CHAPTERS:
-            all_items.extend(buckets.get(chap, []))
-        random.shuffle(all_items)
-        need = ROUND_SIZE - len(chosen)
-        chosen.extend(all_items[:need])
-
-    seen_ids = set()
-    uniq = []
-    for q in chosen:
-        qid = q.get("id")
-        if qid and qid not in seen_ids:
-            uniq.append(q)
-            seen_ids.add(qid)
-
-    while len(uniq) < ROUND_SIZE:
-        all_items = []
-        for chap in CHAPTERS:
-            all_items.extend(buckets.get(chap, []))
-        extra = random.choice(all_items)
-        if extra.get("id") not in seen_ids:
-            uniq.append(extra)
-            seen_ids.add(extra.get("id"))
-
-    random.shuffle(uniq)
-    return uniq[:ROUND_SIZE]
+question_manager = QuestionManager()
 
 # =========================
-# UI helpers
+# Session Cleanup Task
+# =========================
+async def cleanup_task(app: Application):
+    """مهمة تنظيف الجلسات القديمة"""
+    while True:
+        try:
+            await asyncio.sleep(CLEANUP_INTERVAL)
+            cutoff = datetime.utcnow() - timedelta(seconds=MAX_ROUND_DURATION)
+            cutoff_str = cutoff.isoformat()
+            
+            with db_manager.get_cursor() as cur:
+                # تنظيف الجولات النشطة القديمة
+                cur.execute("""
+                    SELECT user_id, data FROM active_rounds 
+                    WHERE last_activity < ?
+                """, (cutoff_str,))
+                
+                old_rounds = cur.fetchall()
+                for row in old_rounds:
+                    try:
+                        data = json.loads(row["data"])
+                        score = data.get("round_score", 0)
+                        bonus = data.get("round_bonus", 0)
+                        correct = data.get("round_correct", 0)
+                        total = data.get("total_questions", ROUND_SIZE)
+                        
+                        # حفظ النتيجة كجولة منتهية
+                        save_round_result(
+                            row["user_id"], 
+                            score, 
+                            bonus, 
+                            correct, 
+                            total,
+                            "timeout"
+                        )
+                        
+                        logger.info(f"Cleaned up old round for user {row['user_id']}")
+                    except Exception as e:
+                        logger.error(f"Error cleaning round for user {row['user_id']}: {e}")
+                
+                # حذف الجولات النشطة القديمة
+                cur.execute("DELETE FROM active_rounds WHERE last_activity < ?", (cutoff_str,))
+                
+                # تحديث المستخدمين غير النشطين
+                cur.execute("""
+                    UPDATE users 
+                    SET last_active = updated_at 
+                    WHERE last_active IS NULL
+                """)
+            
+            logger.info("Cleanup task completed")
+            
+        except Exception as e:
+            logger.error(f"Cleanup task error: {e}")
+            await asyncio.sleep(60)
+
+# =========================
+# UI Helpers
 # =========================
 def main_menu_keyboard(user: Dict[str, Any]) -> InlineKeyboardMarkup:
     approved = bool(user.get("is_approved", 0))
     name = user.get("full_name") or ""
-    name_status = "✅ معتمد" if approved else ("⏳ بانتظار الموافقة" if name else "➕ سجّل اسمك")
+    
+    if approved and name:
+        name_status = f"✅ {name[:15]}"
+    elif name:
+        name_status = "⏳ بانتظار الموافقة"
+    else:
+        name_status = "➕ سجّل اسمك"
+    
     kb = [
         [InlineKeyboardButton("🎮 ابدأ جولة (20 سؤال)", callback_data="play_round")],
         [InlineKeyboardButton("🏆 لوحة التميز (Top 10)", callback_data="leaderboard")],
         [InlineKeyboardButton("📊 إحصائياتي", callback_data="my_stats")],
         [InlineKeyboardButton(name_status, callback_data="set_name")],
     ]
+    
+    # إضافة زر استعادة الجولة النشطة إذا كانت موجودة
+    if user.get("user_id"):
+        active_round = load_active_round(user["user_id"])
+        if active_round:
+            kb.insert(0, [InlineKeyboardButton("🔄 استعادة الجولة النشطة", callback_data="resume_round")])
+    
     return InlineKeyboardMarkup(kb)
 
 def answer_keyboard_mcq(options: Dict[str, str]) -> InlineKeyboardMarkup:
     rows = []
     for key in ["A", "B", "C", "D"]:
         if key in options:
-            rows.append([InlineKeyboardButton(f"{key}) {options[key]}", callback_data=f"ans_mcq:{key}")])
+            text = options[key]
+            # قص النص الطويل
+            if len(text) > 40:
+                text = text[:37] + "..."
+            rows.append([InlineKeyboardButton(f"{key}) {text}", callback_data=f"ans_mcq:{key}")])
     rows.append([InlineKeyboardButton("⛔️ إنهاء الجولة", callback_data="end_round")])
     return InlineKeyboardMarkup(rows)
 
@@ -501,323 +762,6 @@ def parse_tf_answer(raw: Any) -> Optional[bool]:
     return None
 
 # =========================
-# Handlers
-# =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await maintenance_block(update, context):
-        return
-    user_id = update.effective_user.id
-    upsert_user(user_id)
-    user = get_user(user_id)
-    msg = (
-        "هلا 👋\n"
-        "أنا بوت المسابقة 🎯\n"
-        "• كل جولة = 20 سؤال موزعة على فصول المنهج\n"
-        "• بونص: كل 3 إجابات صحيحة متتالية = +1\n"
-        "• لوحة التميز Top 10 للطلاب المعتمدين ✅\n\n"
-        "اختر من القائمة 👇"
-    )
-    await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
-    await update.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
-        return
-    pending = get_pending_list()
-    await update.message.reply_text(
-        f"👑 لوحة الأدمن\n"
-        f"• الصيانة: {'✅ شغالة' if MAINTENANCE_ON else '❌ مطفية'}\n"
-        f"• طلبات الأسماء المعلّقة: {len(pending)}\n\n"
-        f"استخدم /pending لعرض الطلبات.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await maintenance_block(update, context):
-        return
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    upsert_user(user_id)
-    user = get_user(user_id)
-    data = query.data
-
-    if data == "set_name":
-        context.user_data["awaiting_name"] = True
-        context.user_data["awaiting_term_answer"] = False
-        await query.message.reply_text(
-            "اكتب اسمك الحقيقي (عربي فقط) مثل: **محمد أحمد**\n"
-            "شروطنا:\n"
-            "• عربي فقط (بدون إنجليزي)\n"
-            "• كلمتين على الأقل\n"
-            "• واضح ومحترم\n\n"
-            "✍️ اكتب الاسم الآن:",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    if data == "leaderboard":
-        lb = get_leaderboard(TOP_N)
-        if not lb:
-            text = "🏆 لوحة التميز فاضية للحين… أول واحد يبدع 🔥"
-        else:
-            lines = ["🏆 **لوحة التميز (Top 10)**\n"]
-            for i, row in enumerate(lb, start=1):
-                lines.append(
-                    f"{i}) {row['full_name']} — ⭐️ {row['total_points']} نقطة (أفضل جولة: {row['best_round_score']})"
-                )
-            text = "\n".join(lines)
-        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-        await query.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
-        return
-
-    if data == "my_stats":
-        name = user.get("full_name") or "—"
-        approved = "✅" if user.get("is_approved", 0) else "⏳"
-        total = user.get("total_points", 0)
-        rounds = user.get("rounds_played", 0)
-        best = user.get("best_round_score", 0)
-        text = (
-            f"📊 **إحصائياتك**\n"
-            f"الاسم: {name} {approved}\n"
-            f"النقاط: ⭐️ {total}\n"
-            f"عدد الجولات: 🎮 {rounds}\n"
-            f"أفضل جولة: 🥇 {best}\n"
-        )
-        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-        await query.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
-        return
-
-    if data == "play_round":
-        await start_round(query, context)
-        return
-
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    admin_id = query.from_user.id
-    if not is_admin(admin_id):
-        await query.message.reply_text("❌ ما لك صلاحية هنا.", reply_markup=ReplyKeyboardRemove())
-        return
-    data = query.data
-    if data.startswith("admin_approve:"):
-        uid = int(data.split(":")[1])
-        approve_name(uid)
-        await query.message.reply_text(f"✅ تم اعتماد المستخدم {uid}", reply_markup=ReplyKeyboardRemove())
-        try:
-            await safe_send(context.bot, uid, "🎉 تم اعتماد اسمك! الحين بتدخل لوحة التميز 🏆", reply_markup=ReplyKeyboardRemove())
-        except Exception:
-            pass
-        return
-    if data.startswith("admin_reject:"):
-        uid = int(data.split(":")[1])
-        reject_name(uid)
-        await query.message.reply_text(f"❌ تم رفض الاسم للمستخدم {uid}", reply_markup=ReplyKeyboardRemove())
-        try:
-            await safe_send(context.bot, uid, "❌ اسمك ما تم اعتماده. اكتب اسمك مرة ثانية بشكل واضح ومحترم.", reply_markup=ReplyKeyboardRemove())
-        except Exception:
-            pass
-        return
-
-async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
-        return
-    pending = get_pending_list()
-    if not pending:
-        await update.message.reply_text("ما فيه طلبات معلّقة ✅", reply_markup=ReplyKeyboardRemove())
-        return
-    for p in pending[:20]:
-        uid = int(p["user_id"])
-        nm = p["full_name"]
-        await update.message.reply_text(
-            f"📝 طلب معلّق:\n• المستخدم: {uid}\n• الاسم: {nm}",
-            reply_markup=admin_pending_keyboard(uid)
-        )
-
-async def start_round(query, context: ContextTypes.DEFAULT_TYPE):
-    user_id = query.from_user.id
-    upsert_user(user_id)
-    items = context.bot_data.get("questions_items")
-    buckets = context.bot_data.get("questions_buckets")
-    if not items or not buckets:
-        await query.message.reply_text("❌ ملف الأسئلة غير جاهز. تأكد أن questions_from_word.json موجود.", reply_markup=ReplyKeyboardRemove())
-        return
-    round_questions = pick_round_questions(user_id, buckets)
-    context.user_data["round_questions"] = round_questions
-    context.user_data["round_index"] = 0
-    context.user_data["round_score"] = 0
-    context.user_data["round_bonus"] = 0
-    context.user_data["round_correct"] = 0
-    context.user_data["round_streak"] = 0
-    context.user_data["round_chapter_correct"] = {c: 0 for c in CHAPTERS}
-    context.user_data["round_chapter_total"] = {c: 0 for c in CHAPTERS}
-    context.user_data["awaiting_term_answer"] = False
-    context.user_data["awaiting_name"] = False
-    await query.message.reply_text("🎮 بدأنا الجولة! جاهز؟ 🔥", reply_markup=ReplyKeyboardRemove())
-    await send_next_question(query.message.chat_id, query.from_user.id, context)
-
-async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    idx = context.user_data.get("round_index", 0)
-    qs: List[Dict[str, Any]] = context.user_data.get("round_questions", [])
-    if idx >= len(qs):
-        await finish_round(chat_id, user_id, context, ended_by_user=False)
-        return
-    
-    # Take a shallow copy so we can modify it for "term" options without affecting the global list
-    original_q = qs[idx]
-    q = original_q.copy()
-    
-    context.user_data["current_q"] = q
-    chap = q.get("_chapter", "—")
-    context.user_data["round_chapter_total"][chap] = context.user_data["round_chapter_total"].get(chap, 0) + 1
-    header = f"📌 السؤال {idx+1}/{ROUND_SIZE}\n\n"
-    t = q.get("type")
-
-    if t == "mcq":
-        question = (q.get("question") or "").strip()
-        options = q.get("options") or {}
-        text = header + f"❓ {question}"
-        await safe_send(context.bot, chat_id, text, reply_markup=answer_keyboard_mcq(options))
-        return
-
-    if t == "tf":
-        st = (q.get("statement") or "").strip()
-        text = header + f"✅/❌ {st}"
-        await safe_send(context.bot, chat_id, text, reply_markup=answer_keyboard_tf())
-        return
-
-    # 🔥 تعديل جذري: تحويل المصطلحات إلى اختيارات
-    if t == "term":
-        definition = (q.get("definition") or "").strip()
-        correct_term = (q.get("term") or "").strip()
-        
-        # نجمع مصطلحات خطأ عشوائية من القائمة الكاملة
-        all_terms = context.bot_data.get("all_terms", [])
-        # نحذف الإجابة الصحيحة من القائمة
-        distractors = [x for x in all_terms if x != correct_term]
-        
-        # نختار 3 عشوائي
-        if len(distractors) >= 3:
-            random_picks = random.sample(distractors, 3)
-        else:
-            random_picks = distractors # fallback logic
-
-        # ندمج الصحيحة مع الخطأ ونخلطهم
-        choices = [correct_term] + random_picks
-        random.shuffle(choices)
-
-        # ننشئ خيارات A, B, C, D
-        options_map = {}
-        keys = ["A", "B", "C", "D"]
-        correct_key = ""
-
-        for i, choice in enumerate(choices):
-            key = keys[i]
-            options_map[key] = choice
-            if choice == correct_term:
-                correct_key = key
-        
-        # نخزن الخيارات في السؤال الحالي عشان نقدر نتحقق منها في answer_callback
-        q["options"] = options_map
-        q["correct"] = correct_key  # نخدع الكود ليتعامل معه كأنه MCQ
-
-        text = header + "🧠 ما هو المصطلح المناسب للتعريف التالي؟\n\n" + f"📘 {definition}"
-        await safe_send(context.bot, chat_id, text, reply_markup=answer_keyboard_mcq(options_map))
-        return
-
-    await safe_send(context.bot, chat_id, "⚠️ نوع سؤال غير معروف… تخطيناه.", reply_markup=ReplyKeyboardRemove())
-    context.user_data["round_index"] = idx + 1
-    await send_next_question(chat_id, user_id, context)
-
-async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await maintenance_block(update, context):
-        return
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-    if "round_questions" not in context.user_data:
-        await query.message.reply_text("ابدأ جولة من القائمة 👇\nاكتب /start", reply_markup=ReplyKeyboardRemove())
-        return
-    q = context.user_data.get("current_q")
-    if not q:
-        await query.message.reply_text("⚠️ ما عندي سؤال حالي.", reply_markup=ReplyKeyboardRemove())
-        return
-    data = query.data
-    if data == "end_round":
-        await finish_round(chat_id, user_id, context, ended_by_user=True)
-        return
-    is_correct = False
-    t = q.get("type")
-    
-    # نتعامل مع MCQ و term بنفس الطريقة الآن
-    if (t == "mcq" or t == "term") and data.startswith("ans_mcq:"):
-        picked = data.split(":")[1]
-        correct = (q.get("correct") or "").strip().upper()
-        is_correct = (picked == correct)
-    
-    elif t == "tf" and data.startswith("ans_tf:"):
-        picked = data.split(":")[1]
-        correct_bool = parse_tf_answer(q.get("answer"))
-        if correct_bool is None:
-            correct_bool = parse_tf_answer(q.get("correct"))
-        if correct_bool is None:
-            correct_bool = False
-        is_correct = (picked == ("true" if correct_bool else "false"))
-    else:
-        await query.message.reply_text("⚠️ إجابة غير متوقعة.", reply_markup=ReplyKeyboardRemove())
-        return
-    await apply_answer_result(chat_id, user_id, context, is_correct)
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await maintenance_block(update, context):
-        return
-    if not update.message or not update.message.text:
-        return
-    user_id = update.effective_user.id
-    chat_id = update.message.chat_id
-    text = update.message.text.strip()
-
-    if context.user_data.get("awaiting_name"):
-        if not looks_like_real_name(text):
-            await update.message.reply_text(
-                "❌ الاسم ما ينفع حسب الشروط.\n"
-                "اكتبه عربي فقط وبكلمتين على الأقل وبشكل محترم.\n"
-                "جرّب مرة ثانية 👇",
-                reply_markup=ReplyKeyboardRemove()
-            )
-            return
-        upsert_user(user_id)
-        set_pending_name(user_id, text)
-        context.user_data["awaiting_name"] = False
-        await update.message.reply_text(
-            "✅ تم استلام الاسم.\n"
-            "صار بانتظار موافقة الأدمن 👑\n"
-            "تقدر تلعب الحين، بس لوحة التميز ما تظهر إلا بعد الاعتماد.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        if ADMIN_IDS:
-            for admin_id in ADMIN_IDS:
-                try:
-                    await safe_send(
-                        context.bot,
-                        admin_id,
-                        f"📝 طلب اعتماد اسم:\n• المستخدم: {user_id}\n• الاسم: {text}",
-                        reply_markup=admin_pending_keyboard(user_id)
-                    )
-                except Exception as e:
-                    logger.warning("Failed notifying admin %s: %s", admin_id, e)
-        return
-    
-    # ألغينا التحقق من نص المصطلحات لأنها صارت اختيارات
-    return
-
-# =========================
 # Motivation phrases
 # =========================
 MOTIVATION_CORRECT = [
@@ -841,91 +785,550 @@ MOTIVATION_BONUS = [
     "💥 كملت سلسلة الصح!",
 ]
 
-async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, is_correct: bool):
-    idx = context.user_data.get("round_index", 0)
-    q = context.user_data.get("current_q") or {}
-    chap = q.get("_chapter", "—")
+# =========================
+# Handlers - محسنة للأداء والثبات
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await maintenance_block(update, context):
+        return
     
-    if is_correct:
-        context.user_data["round_score"] += 1
-        context.user_data["round_correct"] += 1
-        context.user_data["round_streak"] += 1
-        context.user_data["round_chapter_correct"][chap] = context.user_data["round_chapter_correct"].get(chap, 0) + 1
-        streak = context.user_data["round_streak"]
-        if streak % STREAK_BONUS_EVERY == 0:
-            context.user_data["round_bonus"] += 1
-            msg = random.choice(MOTIVATION_BONUS) + "\n✅ صح! 🔥\n+1 (كل 3 صح = +1)"
-        else:
-            msg = "✅ صح! " + random.choice(MOTIVATION_CORRECT)
-        await safe_send(context.bot, chat_id, msg, reply_markup=ReplyKeyboardRemove())
-    else:
-        # 🔥 هنا نضيف عرض الإجابة الصحيحة عند الخطأ
-        context.user_data["round_streak"] = 0
-        
-        correct_text = "—"
-        t = q.get("type")
-        
-        if t in ["mcq", "term"]:
-            # نجيب نص الخيار الصحيح من الـ options
-            c_key = q.get("correct")
-            opts = q.get("options", {})
-            correct_text = opts.get(c_key, "غير معروف")
-        elif t == "tf":
-            c_bool = parse_tf_answer(q.get("answer") or q.get("correct"))
-            correct_text = "✅ صح" if c_bool else "❌ خطأ"
-            
-        msg = f"❌ خطأ! {random.choice(MOTIVATION_WRONG)}\n\n✅ الإجابة الصحيحة كانت: **{correct_text}**"
-        
-        await safe_send(context.bot, chat_id, msg, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-    
-    qid = q.get("id", "")
-    if qid:
-        mark_seen(user_id, qid)
-    context.user_data["round_index"] = idx + 1
-    await send_next_question(chat_id, user_id, context)
-
-async def finish_round(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, ended_by_user: bool):
-    user = get_user(user_id)
-    score = int(context.user_data.get("round_score", 0))
-    bonus = int(context.user_data.get("round_bonus", 0))
-    correct = int(context.user_data.get("round_correct", 0))
-    total = ROUND_SIZE
-    save_round_result(user_id, score, bonus, correct, total)
-    chap_correct = context.user_data.get("round_chapter_correct", {})
-    chap_total = context.user_data.get("round_chapter_total", {})
-    lines = []
-    lines.append("🏁 **انتهت الجولة**" + (" (انتهيت بدري)" if ended_by_user else ""))
-    lines.append(f"✅ الصحيح: {correct}/{total}")
-    lines.append(f"⭐️ نقاط الإجابات: {score}")
-    lines.append(f"🔥 البونص: {bonus}")
-    lines.append(f"🏆 مجموع الجولة: **{score + bonus}**")
-    lines.append("")
-    lines.append("📌 أداءك حسب الفصول:")
-    for c in CHAPTERS:
-        cc = chap_correct.get(c, 0)
-        tt = chap_total.get(c, 0)
-        if tt == 0:
-            continue
-        lines.append(f"• {c}: {cc}/{tt}")
-    if not user.get("is_approved", 0):
-        lines.append("")
-        lines.append("ℹ️ تقدر تجمع نقاط، بس لوحة التميز تظهر بعد اعتماد اسمك ✅")
-    for k in [
-        "round_questions", "round_index", "round_score", "round_bonus",
-        "round_correct", "round_streak", "round_chapter_correct",
-        "round_chapter_total", "current_q", "awaiting_term_answer", "awaiting_name"
-    ]:
-        context.user_data.pop(k, None)
-    await safe_send(
-        context.bot,
-        chat_id,
-        "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    user_id = update.effective_user.id
     upsert_user(user_id)
     user = get_user(user_id)
-    await safe_send(context.bot, chat_id, "اختر من القائمة 👇", reply_markup=main_menu_keyboard(user))
+    
+    # إضافة user_id للسجلات
+    logger.info(f"User {user_id} started bot", extra={'user_id': user_id})
+    
+    msg = (
+        "هلا 👋\n"
+        "أنا بوت المسابقة 🎯\n"
+        "• كل جولة = 20 سؤال موزعة على فصول المنهج\n"
+        "• بونص: كل 3 إجابات صحيحة متتالية = +1\n"
+        "• لوحة التميز Top 10 للطلاب المعتمدين ✅\n\n"
+        "اختر من القائمة 👇"
+    )
+    
+    await safe_send(context.bot, update.message.chat_id, msg, reply_markup=ReplyKeyboardRemove())
+    await safe_send(context.bot, update.message.chat_id, "القائمة:", reply_markup=main_menu_keyboard(user))
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await maintenance_block(update, context):
+        return
+    
+    query = update.callback_query
+    await safe_answer_callback(query)
+    
+    user_id = query.from_user.id
+    upsert_user(user_id)
+    user = get_user(user_id)
+    data = query.data
+    
+    logger.info(f"Menu callback: {data} from user {user_id}", extra={'user_id': user_id})
+    
+    if data == "set_name":
+        context.user_data["awaiting_name"] = True
+        await query.message.reply_text(
+            "اكتب اسمك الحقيقي (عربي فقط) مثل: **محمد أحمد**\n"
+            "شروطنا:\n"
+            "• عربي فقط (بدون إنجليزي)\n"
+            "• كلمتين على الأقل\n"
+            "• واضح ومحترم\n\n"
+            "✍️ اكتب الاسم الآن:",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return
+    
+    if data == "resume_round":
+        active_round = load_active_round(user_id)
+        if active_round:
+            context.user_data.update(active_round)
+            await query.message.reply_text(
+                "🔄 **تم استعادة جولتك النشطة**\n"
+                "استمر من حيث توقفت!",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await send_next_question(query.message.chat_id, user_id, context)
+        else:
+            await query.message.reply_text(
+                "❌ لا توجد جولة نشطة للاستعادة",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        return
+    
+    if data == "leaderboard":
+        lb = get_leaderboard(TOP_N)
+        if not lb:
+            text = "🏆 لوحة التميز فاضية للحين… أول واحد يبدع 🔥"
+        else:
+            lines = ["🏆 **لوحة التميز (Top 10)**\n"]
+            for i, row in enumerate(lb, start=1):
+                lines.append(
+                    f"{i}) {row['full_name']} — ⭐️ {row['total_points']} نقطة (أفضل جولة: {row['best_round_score']})"
+                )
+            text = "\n".join(lines)
+        
+        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+        await query.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
+        return
+    
+    if data == "my_stats":
+        name = user.get("full_name") or "—"
+        approved = "✅" if user.get("is_approved", 0) else "⏳"
+        total = user.get("total_points", 0)
+        rounds = user.get("rounds_played", 0)
+        best = user.get("best_round_score", 0)
+        text = (
+            f"📊 **إحصائياتك**\n"
+            f"الاسم: {name} {approved}\n"
+            f"النقاط: ⭐️ {total}\n"
+            f"عدد الجولات: 🎮 {rounds}\n"
+            f"أفضل جولة: 🥇 {best}\n"
+        )
+        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+        await query.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
+        return
+    
+    if data == "play_round":
+        # التحقق من وجود جولة نشطة
+        active_round = load_active_round(user_id)
+        if active_round:
+            await query.message.reply_text(
+                "⚠️ **لديك جولة نشطة بالفعل**\n\n"
+                "يمكنك:\n"
+                "• استكمال الجولة من الزر 'استعادة الجولة النشطة'\n"
+                "• أو إنهاء الجولة الحالية أولاً",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return
+        
+        await start_round(query, context)
+        return
+
+async def start_round(query, context: ContextTypes.DEFAULT_TYPE):
+    user_id = query.from_user.id
+    upsert_user(user_id)
+    
+    # جلب الأسئلة
+    round_questions = question_manager.pick_round_questions(user_id)
+    
+    if len(round_questions) < 10:  # على الأقل 10 أسئلة للبدء
+        await query.message.reply_text(
+            "❌ **لا توجد أسئلة كافية للبدء**\n"
+            "يرجى إضافة المزيد من الأسئلة إلى الملف",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return
+    
+    # تحويل أسئلة المصطلحات إلى MCQ
+    processed_questions = []
+    for q in round_questions:
+        if q.get("type") == "term":
+            processed_questions.append(question_manager.convert_term_to_mcq(q))
+        else:
+            processed_questions.append(q)
+    
+    # إعداد بيانات الجولة
+    round_data = {
+        "round_questions": processed_questions,
+        "round_index": 0,
+        "round_score": 0,
+        "round_bonus": 0,
+        "round_correct": 0,
+        "round_streak": 0,
+        "round_chapter_correct": {c: 0 for c in CHAPTERS},
+        "round_chapter_total": {c: 0 for c in CHAPTERS},
+        "total_questions": len(processed_questions),
+        "start_time": datetime.utcnow().isoformat(),
+        "last_activity": datetime.utcnow().isoformat()
+    }
+    
+    context.user_data.update(round_data)
+    
+    # حفظ الجولة النشطة
+    save_active_round(user_id, round_data)
+    
+    await query.message.reply_text(
+        f"🎮 **بدأت الجولة!**\n\n"
+        f"عدد الأسئلة: {len(processed_questions)}\n"
+        f"جاهز؟ 🔥",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    
+    await send_next_question(query.message.chat_id, user_id, context)
+
+async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """إرسال السؤال التالي مع تحديث وقت النشاط"""
+    try:
+        # تحديث وقت النشاط
+        now = datetime.utcnow().isoformat()
+        context.user_data["last_activity"] = now
+        
+        # تحديث الجولة النشطة في قاعدة البيانات
+        round_data = {
+            k: v for k, v in context.user_data.items() 
+            if k.startswith("round_") or k in ["total_questions", "start_time", "last_activity"]
+        }
+        save_active_round(user_id, round_data)
+        
+        idx = context.user_data.get("round_index", 0)
+        qs = context.user_data.get("round_questions", [])
+        
+        if idx >= len(qs):
+            await finish_round(chat_id, user_id, context, ended_by_user=False)
+            return
+        
+        q = qs[idx]
+        context.user_data["current_q"] = q
+        
+        chap = q.get("_chapter", "—")
+        context.user_data["round_chapter_total"][chap] = context.user_data["round_chapter_total"].get(chap, 0) + 1
+        
+        header = f"📌 السؤال {idx+1}/{len(qs)}\n\n"
+        t = q.get("type")
+        
+        if t == "mcq":
+            question = (q.get("question") or "").strip()
+            options = q.get("options") or {}
+            text = header + f"❓ {question}"
+            await safe_send(context.bot, chat_id, text, reply_markup=answer_keyboard_mcq(options))
+            return
+        
+        if t == "tf":
+            st = (q.get("statement") or "").strip()
+            text = header + f"✅/❌ {st}"
+            await safe_send(context.bot, chat_id, text, reply_markup=answer_keyboard_tf())
+            return
+        
+        # لا توجد أسئلة term بعد الآن - جميعها تم تحويلها لـ MCQ
+        
+        await safe_send(context.bot, chat_id, "⚠️ نوع سؤال غير معروف… تخطيناه.", reply_markup=ReplyKeyboardRemove())
+        context.user_data["round_index"] = idx + 1
+        await send_next_question(chat_id, user_id, context)
+        
+    except Exception as e:
+        logger.error(f"Error in send_next_question: {e}", extra={'user_id': user_id})
+        await safe_send(context.bot, chat_id, "⚠️ حدث خطأ في تحميل السؤال. حاول مرة أخرى.", reply_markup=ReplyKeyboardRemove())
+
+async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await maintenance_block(update, context):
+        return
+    
+    query = update.callback_query
+    await safe_answer_callback(query)
+    
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    
+    # التحقق من وجود جولة نشطة
+    if "round_questions" not in context.user_data:
+        active_round = load_active_round(user_id)
+        if active_round:
+            context.user_data.update(active_round)
+        else:
+            await query.message.reply_text(
+                "❌ **لا توجد جولة نشطة**\n\n"
+                "ابدأ جولة جديدة من القائمة 👇\n"
+                "اكتب /start للعودة",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return
+    
+    q = context.user_data.get("current_q")
+    if not q:
+        await query.message.reply_text("⚠️ ما عندي سؤال حالي.", reply_markup=ReplyKeyboardRemove())
+        return
+    
+    data = query.data
+    
+    if data == "end_round":
+        await finish_round(chat_id, user_id, context, ended_by_user=True)
+        return
+    
+    is_correct = False
+    t = q.get("type")
+    
+    if t == "mcq" and data.startswith("ans_mcq:"):
+        picked = data.split(":")[1]
+        correct = (q.get("correct") or "").strip().upper()
+        is_correct = (picked == correct)
+    
+    elif t == "tf" and data.startswith("ans_tf:"):
+        picked = data.split(":")[1]
+        correct_bool = parse_tf_answer(q.get("answer"))
+        if correct_bool is None:
+            correct_bool = parse_tf_answer(q.get("correct"))
+        if correct_bool is None:
+            correct_bool = False
+        is_correct = (picked == ("true" if correct_bool else "false"))
+    
+    else:
+        await query.message.reply_text("⚠️ إجابة غير متوقعة.", reply_markup=ReplyKeyboardRemove())
+        return
+    
+    await apply_answer_result(chat_id, user_id, context, is_correct)
+
+async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, is_correct: bool):
+    """معالجة نتيجة الإجابة مع تحديث الجولة النشطة"""
+    try:
+        idx = context.user_data.get("round_index", 0)
+        q = context.user_data.get("current_q") or {}
+        chap = q.get("_chapter", "—")
+        
+        if is_correct:
+            context.user_data["round_score"] += 1
+            context.user_data["round_correct"] += 1
+            context.user_data["round_streak"] += 1
+            context.user_data["round_chapter_correct"][chap] = context.user_data["round_chapter_correct"].get(chap, 0) + 1
+            
+            streak = context.user_data["round_streak"]
+            if streak % STREAK_BONUS_EVERY == 0:
+                context.user_data["round_bonus"] += 1
+                msg = f"{random.choice(MOTIVATION_BONUS)}\n✅ صح! 🔥\n+1 (كل {STREAK_BONUS_EVERY} صح = +1)"
+            else:
+                msg = f"✅ صح! {random.choice(MOTIVATION_CORRECT)}"
+            
+            await safe_send(context.bot, chat_id, msg, reply_markup=ReplyKeyboardRemove())
+        else:
+            context.user_data["round_streak"] = 0
+            
+            # عرض الإجابة الصحيحة
+            correct_text = "—"
+            t = q.get("type")
+            
+            if t == "mcq":
+                c_key = q.get("correct")
+                opts = q.get("options", {})
+                correct_text = opts.get(c_key, "غير معروف")
+            elif t == "tf":
+                c_bool = parse_tf_answer(q.get("answer") or q.get("correct"))
+                correct_text = "✅ صح" if c_bool else "❌ خطأ"
+            
+            msg = f"❌ خطأ! {random.choice(MOTIVATION_WRONG)}\n\n✅ الإجابة الصحيحة كانت: **{correct_text}**"
+            await safe_send(context.bot, chat_id, msg, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+        
+        # تسجيل السؤال كمشاهد
+        qid = q.get("id", "")
+        if qid:
+            mark_seen(user_id, qid)
+        
+        # الانتقال للسؤال التالي
+        context.user_data["round_index"] = idx + 1
+        
+        # تحديث الجولة النشطة
+        round_data = {
+            k: v for k, v in context.user_data.items() 
+            if k.startswith("round_") or k in ["total_questions", "start_time", "last_activity"]
+        }
+        round_data["last_activity"] = datetime.utcnow().isoformat()
+        save_active_round(user_id, round_data)
+        
+        # تأخير قصير قبل السؤال التالي
+        await asyncio.sleep(0.5)
+        await send_next_question(chat_id, user_id, context)
+        
+    except Exception as e:
+        logger.error(f"Error in apply_answer_result: {e}", extra={'user_id': user_id})
+        await safe_send(context.bot, chat_id, "⚠️ حدث خطأ في معالجة إجابتك. حاول مرة أخرى.", reply_markup=ReplyKeyboardRemove())
+
+async def finish_round(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, ended_by_user: bool):
+    """إنهاء الجولة وحفظ النتائج"""
+    try:
+        user = get_user(user_id)
+        
+        score = int(context.user_data.get("round_score", 0))
+        bonus = int(context.user_data.get("round_bonus", 0))
+        correct = int(context.user_data.get("round_correct", 0))
+        total = int(context.user_data.get("total_questions", ROUND_SIZE))
+        
+        # حفظ النتيجة
+        save_round_result(user_id, score, bonus, correct, total)
+        
+        # حذف الجولة النشطة
+        delete_active_round(user_id)
+        
+        chap_correct = context.user_data.get("round_chapter_correct", {})
+        chap_total = context.user_data.get("round_chapter_total", {})
+        
+        lines = []
+        lines.append("🏁 **انتهت الجولة**" + (" (إنهاء مبكر)" if ended_by_user else ""))
+        lines.append(f"✅ الصحيح: {correct}/{total}")
+        lines.append(f"⭐️ نقاط الإجابات: {score}")
+        lines.append(f"🔥 البونص: {bonus}")
+        lines.append(f"🏆 مجموع الجولة: **{score + bonus}**")
+        lines.append("")
+        lines.append("📌 أداءك حسب الفصول:")
+        
+        for c in CHAPTERS:
+            cc = chap_correct.get(c, 0)
+            tt = chap_total.get(c, 0)
+            if tt > 0:
+                lines.append(f"• {c}: {cc}/{tt}")
+        
+        if not user.get("is_approved", 0):
+            lines.append("")
+            lines.append("ℹ️ تقدر تجمع نقاط، بس لوحة التميز تظهر بعد اعتماد اسمك ✅")
+        
+        await safe_send(
+            context.bot,
+            chat_id,
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in finish_round: {e}", extra={'user_id': user_id})
+        await safe_send(
+            context.bot,
+            chat_id,
+            "⚠️ حدث خطأ في إنهاء الجولة، لكن النقاط تم حفظها.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    finally:
+        # تنظيف بيانات الجولة من context.user_data
+        keys_to_remove = [
+            "round_questions", "round_index", "round_score", "round_bonus",
+            "round_correct", "round_streak", "round_chapter_correct",
+            "round_chapter_total", "current_q", "total_questions",
+            "start_time", "last_activity"
+        ]
+        
+        for key in keys_to_remove:
+            context.user_data.pop(key, None)
+        
+        # العودة للقائمة الرئيسية
+        upsert_user(user_id)
+        user = get_user(user_id)
+        await safe_send(
+            context.bot,
+            chat_id,
+            "اختر من القائمة 👇",
+            reply_markup=main_menu_keyboard(user)
+        )
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await maintenance_block(update, context):
+        return
+    
+    if not update.message or not update.message.text:
+        return
+    
+    user_id = update.effective_user.id
+    chat_id = update.message.chat_id
+    text = update.message.text.strip()
+    
+    # تسجيل الاسم
+    if context.user_data.get("awaiting_name"):
+        if not looks_like_real_name(text):
+            await update.message.reply_text(
+                "❌ الاسم ما ينفع حسب الشروط.\n"
+                "اكتبه عربي فقط وبكلمتين على الأقل وبشكل محترم.\n"
+                "جرّب مرة ثانية 👇",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return
+        
+        upsert_user(user_id)
+        set_pending_name(user_id, text)
+        context.user_data["awaiting_name"] = False
+        
+        await update.message.reply_text(
+            "✅ تم استلام الاسم.\n"
+            "صار بانتظار موافقة الأدمن 👑\n"
+            "تقدر تلعب الحين، بس لوحة التميز ما تظهر إلا بعد الاعتماد.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        
+        # إشعار المشرفين
+        for admin_id in ADMIN_IDS:
+            try:
+                await safe_send(
+                    context.bot,
+                    admin_id,
+                    f"📝 طلب اعتماد اسم:\n• المستخدم: {user_id}\n• الاسم: {text}",
+                    reply_markup=admin_pending_keyboard(user_id)
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify admin {admin_id}: {e}")
+        return
+    
+    # لا توجد معالجة نصوص أخرى - جميع الأسئلة الآن اختيارية
+    await update.message.reply_text(
+        "استخدم القائمة للتنقل بين الخيارات 👇\n"
+        "اكتب /start للعودة إلى القائمة الرئيسية",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+# =========================
+# Admin Handlers
+# =========================
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
+        return
+    
+    pending = get_pending_list()
+    await update.message.reply_text(
+        f"👑 لوحة الأدمن\n"
+        f"• الصيانة: {'✅ شغالة' if MAINTENANCE_ON else '❌ مطفية'}\n"
+        f"• طلبات الأسماء المعلّقة: {len(pending)}\n\n"
+        f"استخدم /pending لعرض الطلبات.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_callback(query)
+    
+    admin_id = query.from_user.id
+    if not is_admin(admin_id):
+        await query.message.reply_text("❌ ما لك صلاحية هنا.", reply_markup=ReplyKeyboardRemove())
+        return
+    
+    data = query.data
+    
+    if data.startswith("admin_approve:"):
+        uid = int(data.split(":")[1])
+        approve_name(uid)
+        await query.message.reply_text(f"✅ تم اعتماد المستخدم {uid}", reply_markup=ReplyKeyboardRemove())
+        
+        try:
+            await safe_send(context.bot, uid, "🎉 تم اعتماد اسمك! الحين بتدخل لوحة التميز 🏆", reply_markup=ReplyKeyboardRemove())
+        except Exception as e:
+            logger.warning(f"Failed to notify user {uid}: {e}")
+        return
+    
+    if data.startswith("admin_reject:"):
+        uid = int(data.split(":")[1])
+        reject_name(uid)
+        await query.message.reply_text(f"❌ تم رفض الاسم للمستخدم {uid}", reply_markup=ReplyKeyboardRemove())
+        
+        try:
+            await safe_send(context.bot, uid, "❌ اسمك ما تم اعتماده. اكتب اسمك مرة ثانية بشكل واضح ومحترم.", reply_markup=ReplyKeyboardRemove())
+        except Exception as e:
+            logger.warning(f"Failed to notify user {uid}: {e}")
+        return
+
+async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
+        return
+    
+    pending = get_pending_list()
+    if not pending:
+        await update.message.reply_text("ما فيه طلبات معلّقة ✅", reply_markup=ReplyKeyboardRemove())
+        return
+    
+    for p in pending[:20]:
+        uid = int(p["user_id"])
+        nm = p["full_name"]
+        await update.message.reply_text(
+            f"📝 طلب معلّق:\n• المستخدم: {uid}\n• الاسم: {nm}",
+            reply_markup=admin_pending_keyboard(uid)
+        )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
@@ -937,76 +1340,113 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
 
+async def reload_questions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إعادة تحميل الأسئلة من الملف"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
+        return
+    
+    question_manager.load_questions()
+    await update.message.reply_text(
+        f"✅ تم إعادة تحميل الأسئلة\n"
+        f"• عدد الأسئلة: {len(question_manager.items)}\n"
+        f"• عدد المصطلحات: {len(question_manager.term_pool)}",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
 # =========================
 # Global error handler
 # =========================
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled error: %s", context.error)
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """معالج الأخطاء العام"""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    
+    # إذا كان هناك تحديث، نرسل رسالة خطأ للمستخدم
+    if isinstance(update, Update):
+        try:
+            if update.message:
+                chat_id = update.message.chat_id
+                await safe_send(
+                    context.bot,
+                    chat_id,
+                    "⚠️ حدث خطأ غير متوقع. الرجاء المحاولة مرة أخرى.",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+            elif update.callback_query:
+                await safe_answer_callback(
+                    update.callback_query,
+                    "حدث خطأ غير متوقع",
+                    show_alert=True
+                )
+        except Exception as e:
+            logger.error(f"Error in error handler: {e}")
 
 # =========================
 # Main
 # =========================
 def main():
-    db_init()
-    try:
-        items = load_questions()
-    except Exception as e:
-        logger.exception("Failed loading questions file: %s", e)
-        items = []
-    buckets = build_chapter_buckets(items) if items else None
+    """الدالة الرئيسية لتشغيل البوت"""
     
-    # 🆕 نجمع كل المصطلحات عشان نستخدمها كخيارات خطأ
-    all_terms_set = set()
-    for it in items:
-        if it.get("type") == "term":
-            val = it.get("term")
-            if val:
-                all_terms_set.add(val.strip())
-    all_terms_list = list(all_terms_set)
-
-    # 1) زيادة المهلة (Timeout) لتجنب TimedOut
+    # تحميل الأسئلة أولاً
+    question_manager.load_questions()
+    
+    if not question_manager.items:
+        logger.error("No questions loaded! Check questions_from_word.json")
+        print("❌ لم يتم تحميل أي أسئلة! تحقق من ملف questions_from_word.json")
+        return
+    
+    logger.info(f"Loaded {len(question_manager.items)} questions")
+    logger.info(f"Admins: {sorted(list(ADMIN_IDS))}")
+    logger.info(f"Maintenance mode: {MAINTENANCE_ON}")
+    
+    # إعداد request مع timeouts محسنة
     request = HTTPXRequest(
-        connect_timeout=60.0,
-        read_timeout=60.0,
-        write_timeout=60.0,
-        pool_timeout=60.0,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
     )
-
-    # 2) استخدام request فقط
+    
+    # إنشاء التطبيق
     app = Application.builder() \
         .token(BOT_TOKEN) \
         .request(request) \
+        .concurrent_updates(True) \
         .build()
-
-    app.bot_data["questions_items"] = items
-    app.bot_data["questions_buckets"] = buckets
-    # نخزن المصطلحات هنا
-    app.bot_data["all_terms"] = all_terms_list
-
-    # Commands
+    
+    # إضافة handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("pending", pending_command))
-
-    # Callbacks
+    app.add_handler(CommandHandler("reload", reload_questions_command))
+    
+    # Callback handlers
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
     app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^(ans_mcq:|ans_tf:|end_round)"))
-    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(play_round|leaderboard|my_stats|set_name)$"))
-
-    # Text router
+    app.add_handler(CallbackQueryHandler(menu_callback))
+    
+    # Text handler
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
-
+    
     # Error handler
-    app.add_error_handler(on_error)
-
-    logger.info("Bot started. Admins=%s Maintenance=%s", sorted(list(ADMIN_IDS)), MAINTENANCE_ON)
-
-    # 3) 🔥 تعديل للسرعة: ضبط poll_interval لصفر ليكون أسرع ما يمكن
+    app.add_error_handler(error_handler)
+    
+    # بدء مهمة التنظيف
+    app.job_queue.run_once(
+        lambda ctx: asyncio.create_task(cleanup_task(app)),
+        when=5
+    )
+    
+    # تشغيل البوت مع إعدادات مثالية للثبات
+    logger.info("Starting bot with improved stability settings...")
+    
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
-        poll_interval=0.0
+        poll_interval=0.5,  # ليست سريعة جداً ولا بطيئة جداً
+        close_loop=False
     )
 
 if __name__ == "__main__":

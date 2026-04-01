@@ -42,6 +42,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in Railway Variables.")
 
+# يوزرك في تلغرام للتواصل المباشر
+YOUR_TELEGRAM_USERNAME = "mohamoha123"
+
 ADMIN_IDS = set()
 _admin_single = os.getenv("ADMIN_USER_ID", "").strip()
 if _admin_single.isdigit():
@@ -651,26 +654,32 @@ def main_menu_keyboard(user: Dict[str, Any]) -> InlineKeyboardMarkup:
     approved = bool(user.get("is_approved", 0))
     name = user.get("full_name") or ""
     
+    # التحقق مما إذا كان للمستخدم طلب معلق
+    is_pending = False
+    user_id = user.get("user_id")
+    if user_id and not approved:
+        with db_manager.get_cursor() as cur:
+            cur.execute("SELECT 1 FROM pending_names WHERE user_id=?", (user_id,))
+            if cur.fetchone():
+                is_pending = True
+    
     if approved and name:
         name_status = f"✅ {name[:15]}"
-    elif name:
+    elif is_pending:
         name_status = "⏳ بانتظار الموافقة"
     else:
         name_status = "➕ سجّل اسمك"
     
-    # ---------------------------------------------------------
-    # الإضافة تمت هنا: زر يفتح محادثة مباشرة مع يوزرك بالتلغرام
-    # ---------------------------------------------------------
     kb = [
         [InlineKeyboardButton("🎮 ابدأ جولة (20 سؤال)", callback_data="play_round")],
         [InlineKeyboardButton("🏆 لوحة التميز (Top 10)", callback_data="leaderboard")],
         [InlineKeyboardButton("📊 إحصائياتي", callback_data="my_stats")],
         [InlineKeyboardButton(name_status, callback_data="set_name")],
-        [InlineKeyboardButton("💬 تواصل مع المشرف", url="https://t.me/mohamoha123")], 
+        [InlineKeyboardButton("💬 تواصل مع المشرف مباشرة", url=f"https://t.me/{YOUR_TELEGRAM_USERNAME}")]
     ]
     
-    if user.get("user_id"):
-        active_round = load_active_round(user["user_id"])
+    if user_id:
+        active_round = load_active_round(user_id)
         if active_round:
             kb.insert(0, [InlineKeyboardButton("🔄 استعادة الجولة النشطة", callback_data="resume_round")])
     
@@ -779,6 +788,20 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Menu callback: {data} from user {user_id}")
     
     if data == "set_name":
+        # === حماية من التسجيل المتكرر ===
+        if user.get("is_approved"):
+            await query.message.reply_text("✅ اسمك معتمد مسبقاً في لوحة التميز، لا تحتاج للتسجيل مرة أخرى.", reply_markup=ReplyKeyboardRemove())
+            await safe_send(context.bot, query.message.chat_id, "القائمة:", reply_markup=main_menu_keyboard(user))
+            return
+            
+        with db_manager.get_cursor() as cur:
+            cur.execute("SELECT 1 FROM pending_names WHERE user_id=?", (user_id,))
+            if cur.fetchone():
+                await query.message.reply_text("⏳ طلبك قيد المراجعة! يرجى انتظار اعتماد المشرف لاسمك.", reply_markup=ReplyKeyboardRemove())
+                await safe_send(context.bot, query.message.chat_id, "القائمة:", reply_markup=main_menu_keyboard(user))
+                return
+        # =================================
+
         context.user_data["awaiting_name"] = True
         await query.message.reply_text(
             "اكتب اسمك الحقيقي (عربي فقط) مثل: **محمد أحمد**\n"

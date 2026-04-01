@@ -726,6 +726,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_answer_callback(query)
     
     user_id = query.from_user.id
+    chat_id = query.message.chat_id
     upsert_user(user_id)
     user = get_user(user_id)
     data = query.data
@@ -733,7 +734,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "set_name":
         context.user_data["awaiting_name"] = True
         context.user_data["awaiting_contact"] = False
-        await query.message.reply_text(
+        await safe_send(
+            context.bot,
+            chat_id,
             "اكتب اسمك الحقيقي (عربي فقط) مثل: **محمد أحمد**\n"
             "شروطنا:\n"
             "• عربي فقط (بدون إنجليزي)\n"
@@ -748,7 +751,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "contact_admin":
         context.user_data["awaiting_contact"] = True
         context.user_data["awaiting_name"] = False
-        await query.message.reply_text(
+        await safe_send(
+            context.bot,
+            chat_id,
             "📝 اكتب رسالتك أو استفسارك الآن، وراح توصل للمشرف مباشرة:",
             reply_markup=ReplyKeyboardRemove()
         )
@@ -758,10 +763,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_round = load_active_round(user_id)
         if active_round:
             context.user_data.update(active_round)
-            await query.message.reply_text("🔄 **تم استعادة جولتك النشطة**\nاستمر من حيث توقفت!", reply_markup=ReplyKeyboardRemove())
-            await send_next_question(query.message.chat_id, user_id, context)
+            await safe_send(context.bot, chat_id, "🔄 **تم استعادة جولتك النشطة**\nاستمر من حيث توقفت!", reply_markup=ReplyKeyboardRemove())
+            await send_next_question(chat_id, user_id, context)
         else:
-            await query.message.reply_text("❌ لا توجد جولة نشطة للاستعادة", reply_markup=ReplyKeyboardRemove())
+            await safe_send(context.bot, chat_id, "❌ لا توجد جولة نشطة للاستعادة", reply_markup=ReplyKeyboardRemove())
         return
     
     if data == "leaderboard":
@@ -774,8 +779,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"{i}) {row['full_name']} — ⭐️ {row['total_points']} نقطة (أفضل جولة: {row['best_round_score']})")
             text = "\n".join(lines)
         
-        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-        await query.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
+        await safe_send(context.bot, chat_id, text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, "القائمة:", reply_markup=main_menu_keyboard(user))
         return
     
     if data == "my_stats":
@@ -785,20 +790,22 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rounds = user.get("rounds_played", 0)
         best = user.get("best_round_score", 0)
         text = (f"📊 **إحصائياتك**\nالاسم: {name} {approved}\nالنقاط: ⭐️ {total}\nعدد الجولات: 🎮 {rounds}\nأفضل جولة: 🥇 {best}\n")
-        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-        await query.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
+        await safe_send(context.bot, chat_id, text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, "القائمة:", reply_markup=main_menu_keyboard(user))
         return
     
     if data == "play_round":
         active_round = load_active_round(user_id)
         if active_round:
-            await query.message.reply_text(
+            await safe_send(
+                context.bot,
+                chat_id,
                 "⚠️ **لديك جولة نشطة بالفعل**\n\nيمكنك:\n• استكمال الجولة من الزر 'استعادة الجولة النشطة'\n• أو إنهاء الجولة الحالية أولاً",
                 reply_markup=ReplyKeyboardRemove()
             )
             return
         
-        await query.message.reply_text("اختر الفصل الدراسي للبدء 🎯:", reply_markup=term_selection_keyboard())
+        await safe_send(context.bot, chat_id, "اختر الفصل الدراسي للبدء 🎯:", reply_markup=term_selection_keyboard())
         return
 
     if data in ("start_term1", "start_term2"):
@@ -806,18 +813,19 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "back_to_main":
-        await query.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
+        await safe_send(context.bot, chat_id, "القائمة:", reply_markup=main_menu_keyboard(user))
         return
 
 async def start_round(query, context: ContextTypes.DEFAULT_TYPE, term: str):
     user_id = query.from_user.id
+    chat_id = query.message.chat_id
     upsert_user(user_id)
     
     qm = qm_term1 if term == "start_term1" else qm_term2
     round_questions = qm.pick_round_questions(user_id)
     
     if len(round_questions) < 10:
-        await query.message.reply_text("❌ **لا توجد أسئلة كافية للبدء في هذا الفصل**", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, "❌ **لا توجد أسئلة كافية للبدء في هذا الفصل**", reply_markup=ReplyKeyboardRemove())
         return
     
     processed_questions = []
@@ -845,14 +853,16 @@ async def start_round(query, context: ContextTypes.DEFAULT_TYPE, term: str):
     save_active_round(user_id, round_data)
     
     term_name = "الفصل الدراسي الأول" if term == "start_term1" else "الفصل الدراسي الثاني"
-    await query.message.reply_text(
+    await safe_send(
+        context.bot,
+        chat_id,
         f"🎮 **بدأت الجولة! ({term_name})**\n\n"
         f"عدد الأسئلة: {len(processed_questions)}\n"
         f"جاهز؟ 🔥",
         reply_markup=ReplyKeyboardRemove()
     )
     
-    await send_next_question(query.message.chat_id, user_id, context)
+    await send_next_question(chat_id, user_id, context)
 
 async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -917,12 +927,12 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if active_round:
             context.user_data.update(active_round)
         else:
-            await query.message.reply_text("❌ **لا توجد جولة نشطة**\nاكتب /start للعودة", reply_markup=ReplyKeyboardRemove())
+            await safe_send(context.bot, chat_id, "❌ **لا توجد جولة نشطة**\nاكتب /start للعودة", reply_markup=ReplyKeyboardRemove())
             return
     
     q = context.user_data.get("current_q")
     if not q:
-        await query.message.reply_text("⚠️ ما عندي سؤال حالي.", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, "⚠️ ما عندي سؤال حالي.", reply_markup=ReplyKeyboardRemove())
         return
     
     data = query.data
@@ -949,7 +959,7 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_correct = (picked == ("true" if correct_bool else "false"))
     
     else:
-        await query.message.reply_text("⚠️ إجابة غير متوقعة.", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, "⚠️ إجابة غير متوقعة.", reply_markup=ReplyKeyboardRemove())
         return
     
     await apply_answer_result(chat_id, user_id, context, is_correct)
@@ -1070,60 +1080,56 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user_id = update.effective_user.id
+    chat_id = update.message.chat_id
     text = update.message.text.strip()
 
-    # == ميزة رد المشرف على رسالة الطالب ==
-    if is_admin(user_id) and update.message.reply_to_message:
-        reply_text = update.message.reply_to_message.text
-        # استخراج الآيدي الخاص بالطالب من رسالة البوت السابقة
-        match = re.search(r"\(ID:\s*(\d+)\)", reply_text)
-        if match:
-            target_user_id = int(match.group(1))
-            try:
+    try:
+        # == ميزة رد المشرف على رسالة الطالب ==
+        if is_admin(user_id) and update.message.reply_to_message:
+            reply_text = update.message.reply_to_message.text or ""
+            match = re.search(r"\(ID:\s*(\d+)\)", reply_text)
+            if match:
+                target_user_id = int(match.group(1))
                 await safe_send(context.bot, target_user_id, f"👨‍🏫 **رد من المشرف:**\n\n{text}")
-                await update.message.reply_text("✅ تم إرسال ردك للطالب بنجاح.")
-            except Exception as e:
-                logger.error(f"Failed to send admin reply: {e}")
-                await update.message.reply_text("❌ فشل إرسال الرد للطالب. قد يكون الطالب قام بحظر البوت.")
+                await safe_send(context.bot, chat_id, "✅ تم إرسال ردك للطالب بنجاح.")
+                return
+
+        # معالجة رسالة التواصل مع المشرف
+        if context.user_data.get("awaiting_contact"):
+            context.user_data["awaiting_contact"] = False
+            user = get_user(user_id)
+            name = user.get("full_name") or update.effective_user.full_name or "بدون اسم"
+            
+            await safe_send(context.bot, chat_id, "✅ تم إرسال رسالتك للمشرف بنجاح. شكراً لتواصلك معنا!", reply_markup=ReplyKeyboardRemove())
+            
+            for admin_id in ADMIN_IDS:
+                admin_msg = f"📩 رسالة جديدة من مستخدم:\n\n👤 المستخدم: {name} (ID: {user_id})\n📝 الرسالة:\n{text}"
+                await safe_send(context.bot, admin_id, admin_msg)
+            
+            await safe_send(context.bot, chat_id, "القائمة:", reply_markup=main_menu_keyboard(user))
             return
 
-    # معالجة رسالة التواصل مع المشرف
-    if context.user_data.get("awaiting_contact"):
-        context.user_data["awaiting_contact"] = False
-        user = get_user(user_id)
-        name = user.get("full_name") or update.effective_user.full_name or "بدون اسم"
-        
-        await update.message.reply_text("✅ تم إرسال رسالتك للمشرف بنجاح. شكراً لتواصلك معنا!", reply_markup=ReplyKeyboardRemove())
-        
-        for admin_id in ADMIN_IDS:
-            try:
-                await safe_send(context.bot, admin_id, f"📩 **رسالة جديدة من مستخدم:**\n\n👤 المستخدم: {name} (ID: {user_id})\n📝 الرسالة:\n{text}", parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Failed to send contact message to admin: {e}")
-        
-        await safe_send(context.bot, update.message.chat_id, "القائمة:", reply_markup=main_menu_keyboard(user))
-        return
-
-    # معالجة طلب تسجيل الاسم
-    if context.user_data.get("awaiting_name"):
-        if not looks_like_real_name(text):
-            await update.message.reply_text("❌ الاسم ما ينفع حسب الشروط.\nجرّب مرة ثانية 👇", reply_markup=ReplyKeyboardRemove())
-            return
-        
-        upsert_user(user_id)
-        set_pending_name(user_id, text)
-        context.user_data["awaiting_name"] = False
-        
-        await update.message.reply_text("✅ تم استلام الاسم. بانتظار موافقة الأدمن 👑", reply_markup=ReplyKeyboardRemove())
-        
-        for admin_id in ADMIN_IDS:
-            try:
+        # معالجة طلب تسجيل الاسم
+        if context.user_data.get("awaiting_name"):
+            if not looks_like_real_name(text):
+                await safe_send(context.bot, chat_id, "❌ الاسم ما ينفع حسب الشروط.\nجرّب مرة ثانية 👇", reply_markup=ReplyKeyboardRemove())
+                return
+            
+            upsert_user(user_id)
+            set_pending_name(user_id, text)
+            context.user_data["awaiting_name"] = False
+            
+            await safe_send(context.bot, chat_id, "✅ تم استلام الاسم. بانتظار موافقة الأدمن 👑", reply_markup=ReplyKeyboardRemove())
+            
+            for admin_id in ADMIN_IDS:
                 await safe_send(context.bot, admin_id, f"📝 طلب اعتماد اسم:\n• المستخدم: {user_id}\n• الاسم: {text}", reply_markup=admin_pending_keyboard(user_id))
-            except Exception:
-                pass
-        return
-    
-    await update.message.reply_text("استخدم القائمة للتنقل 👇\nاكتب /start للعودة", reply_markup=ReplyKeyboardRemove())
+            return
+        
+        await safe_send(context.bot, chat_id, "استخدم القائمة للتنقل 👇\nاكتب /start للعودة", reply_markup=ReplyKeyboardRemove())
+        
+    except Exception as e:
+        logger.error(f"Error in text_router: {e}")
+        await safe_send(context.bot, chat_id, "⚠️ حدث خطأ، يرجى المحاولة مرة أخرى.", reply_markup=ReplyKeyboardRemove())
 
 # =========================
 # Admin Handlers
@@ -1131,18 +1137,19 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, update.message.chat_id, "❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
         return
     pending = get_pending_list()
-    await update.message.reply_text(f"👑 لوحة الأدمن\nطلبات الأسماء المعلّقة: {len(pending)}\nاستخدم /pending لعرض الطلبات.", reply_markup=ReplyKeyboardRemove())
+    await safe_send(context.bot, update.message.chat_id, f"👑 لوحة الأدمن\nطلبات الأسماء المعلّقة: {len(pending)}\nاستخدم /pending لعرض الطلبات.", reply_markup=ReplyKeyboardRemove())
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await safe_answer_callback(query)
     
     admin_id = query.from_user.id
+    chat_id = query.message.chat_id
     if not is_admin(admin_id):
-        await query.message.reply_text("❌ ما لك صلاحية هنا.", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, "❌ ما لك صلاحية هنا.", reply_markup=ReplyKeyboardRemove())
         return
     
     data = query.data
@@ -1150,7 +1157,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("admin_approve:"):
         uid = int(data.split(":")[1])
         approve_name(uid)
-        await query.message.reply_text(f"✅ تم اعتماد المستخدم {uid}", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, f"✅ تم اعتماد المستخدم {uid}", reply_markup=ReplyKeyboardRemove())
         try:
             await safe_send(context.bot, uid, "🎉 تم اعتماد اسمك! الحين بتدخل لوحة التميز 🏆", reply_markup=ReplyKeyboardRemove())
         except Exception:
@@ -1160,7 +1167,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("admin_reject:"):
         uid = int(data.split(":")[1])
         reject_name(uid)
-        await query.message.reply_text(f"❌ تم رفض الاسم للمستخدم {uid}", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, f"❌ تم رفض الاسم للمستخدم {uid}", reply_markup=ReplyKeyboardRemove())
         try:
             await safe_send(context.bot, uid, "❌ اسمك ما تم اعتماده. اكتب اسمك مرة ثانية بشكل محترم.", reply_markup=ReplyKeyboardRemove())
         except Exception:
@@ -1169,33 +1176,30 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.message.chat_id
     if not is_admin(user_id):
-        await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, "❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
         return
     pending = get_pending_list()
     if not pending:
-        await update.message.reply_text("ما فيه طلبات معلّقة ✅", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, "ما فيه طلبات معلّقة ✅", reply_markup=ReplyKeyboardRemove())
         return
     for p in pending[:20]:
-        await update.message.reply_text(f"📝 طلب معلّق:\n• المستخدم: {p['user_id']}\n• الاسم: {p['full_name']}", reply_markup=admin_pending_keyboard(p['user_id']))
+        await safe_send(context.bot, chat_id, f"📝 طلب معلّق:\n• المستخدم: {p['user_id']}\n• الاسم: {p['full_name']}", reply_markup=admin_pending_keyboard(p['user_id']))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("الأوامر:\n/start — تشغيل البوت\n/admin — للأدمن\n/pending — طلبات الأسماء\n/reload — تحديث الأسئلة", reply_markup=ReplyKeyboardRemove())
+    await safe_send(context.bot, update.message.chat_id, "الأوامر:\n/start — تشغيل البوت\n/admin — للأدمن\n/pending — طلبات الأسماء\n/reload — تحديث الأسئلة", reply_markup=ReplyKeyboardRemove())
 
 async def reload_questions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.message.chat_id
     if not is_admin(user_id):
-        await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
+        await safe_send(context.bot, chat_id, "❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
         return
     
     qm_term1.load_questions()
     qm_term2.load_questions()
-    await update.message.reply_text(
-        f"✅ تم إعادة تحميل الأسئلة للملفين\n"
-        f"• أسئلة الفصل الأول: {len(qm_term1.items)}\n"
-        f"• أسئلة الفصل الثاني: {len(qm_term2.items)}",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await safe_send(context.bot, chat_id, f"✅ تم إعادة تحميل الأسئلة للملفين\n• أسئلة الفصل الأول: {len(qm_term1.items)}\n• أسئلة الفصل الثاني: {len(qm_term2.items)}", reply_markup=ReplyKeyboardRemove())
 
 # =========================
 # Global error handler

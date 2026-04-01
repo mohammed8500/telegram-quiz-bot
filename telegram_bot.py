@@ -607,7 +607,6 @@ class QuestionManager:
         
         return mcq_question
 
-# إنشاء مدير لكل فصل
 qm_term1 = QuestionManager(TERM1_FILE)
 qm_term2 = QuestionManager(TERM2_FILE)
 
@@ -659,11 +658,15 @@ def main_menu_keyboard(user: Dict[str, Any]) -> InlineKeyboardMarkup:
     else:
         name_status = "➕ سجّل اسمك"
     
+    # ---------------------------------------------------------
+    # الإضافة تمت هنا: زر يفتح محادثة مباشرة مع يوزرك بالتلغرام
+    # ---------------------------------------------------------
     kb = [
         [InlineKeyboardButton("🎮 ابدأ جولة (20 سؤال)", callback_data="play_round")],
         [InlineKeyboardButton("🏆 لوحة التميز (Top 10)", callback_data="leaderboard")],
         [InlineKeyboardButton("📊 إحصائياتي", callback_data="my_stats")],
         [InlineKeyboardButton(name_status, callback_data="set_name")],
+        [InlineKeyboardButton("💬 تواصل مع المشرف", url="https://t.me/mohamoha123")], 
     ]
     
     if user.get("user_id"):

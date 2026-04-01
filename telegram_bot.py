@@ -42,7 +42,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in Railway Variables.")
 
-ADMIN_IDS = set()
+# الآيدي الخاص بك كأدمن أساسي
+ADMIN_IDS = {290185541}
+
 _admin_single = os.getenv("ADMIN_USER_ID", "").strip()
 if _admin_single.isdigit():
     ADMIN_IDS.add(int(_admin_single))
@@ -59,7 +61,9 @@ MAINTENANCE_ON = MAINTENANCE_MODE in ("1", "true", "True", "YES", "yes", "on", "
 
 BAD_WORDS = set(w.strip() for w in os.getenv("BAD_WORDS", "").split(",") if w.strip())
 
-QUESTIONS_FILE = os.getenv("QUESTIONS_FILE", "questions_from_word.json").strip()
+# تعريف ملفات الفصول
+TERM1_FILE = os.getenv("TERM1_FILE", "questions_from_word.json").strip()
+TERM2_FILE = os.getenv("TERM2_FILE", "questions_term2.json").strip()
 DB_FILE = os.getenv("DB_FILE", "data.db").strip()
 
 # =========================
@@ -77,14 +81,13 @@ CHAPTERS = [
     "حالات المادة",
     "الطاقة وتحولاتها",
     "أجهزة الجسم",
+    "النباتات"
 ]
 
 # =========================
 # Database Connection Pooling
 # =========================
 class DatabaseManager:
-    """مدير اتصالات قاعدة البيانات مع connection pooling"""
-    
     _instance = None
     
     def __new__(cls):
@@ -94,7 +97,6 @@ class DatabaseManager:
         return cls._instance
     
     def _init_pool(self):
-        """تهيئة اتصال دائم مع إعدادات متقدمة"""
         self.conn = sqlite3.connect(
             DB_FILE,
             check_same_thread=False,
@@ -108,10 +110,7 @@ class DatabaseManager:
         self._init_tables()
     
     def _init_tables(self):
-        """تهيئة الجداول"""
         cur = self.conn.cursor()
-        
-        # جدول المستخدمين
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -125,8 +124,6 @@ class DatabaseManager:
                 last_active TEXT
             )
         """)
-        
-        # جدول طلبات الأسماء
         cur.execute("""
             CREATE TABLE IF NOT EXISTS pending_names (
                 user_id INTEGER PRIMARY KEY,
@@ -135,8 +132,6 @@ class DatabaseManager:
                 status TEXT DEFAULT 'pending'
             )
         """)
-        
-        # جدول الأسئلة المشاهدة
         cur.execute("""
             CREATE TABLE IF NOT EXISTS seen_questions (
                 user_id INTEGER,
@@ -145,8 +140,6 @@ class DatabaseManager:
                 PRIMARY KEY (user_id, qid)
             )
         """)
-        
-        # جدول الجولات
         cur.execute("""
             CREATE TABLE IF NOT EXISTS rounds (
                 round_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,8 +153,6 @@ class DatabaseManager:
                 status TEXT DEFAULT 'completed'
             )
         """)
-        
-        # جدول الجولات النشطة
         cur.execute("""
             CREATE TABLE IF NOT EXISTS active_rounds (
                 user_id INTEGER PRIMARY KEY,
@@ -170,12 +161,10 @@ class DatabaseManager:
                 last_activity TEXT
             )
         """)
-        
         self.conn.commit()
     
     @contextmanager
     def get_cursor(self):
-        """الحصول على مؤشر للاستعلامات"""
         cursor = self.conn.cursor()
         try:
             yield cursor
@@ -187,7 +176,6 @@ class DatabaseManager:
             cursor.close()
     
     def close(self):
-        """إغلاق الاتصال"""
         if self.conn:
             self.conn.close()
 
@@ -197,46 +185,36 @@ db_manager = DatabaseManager()
 # Robust send helpers
 # =========================
 SEND_RETRIES = 3
-SEND_TIMEOUT = 10  # 10 ثواني كحد أقصى للإرسال
+SEND_TIMEOUT = 10
 
 async def safe_send(bot, chat_id: int, text: str, **kwargs):
-    """إرسال آمن مع إعادة المحاولة"""
     for attempt in range(1, SEND_RETRIES + 1):
         try:
-            # إضافة timeout صريح
             return await asyncio.wait_for(
                 bot.send_message(chat_id=chat_id, text=text, **kwargs),
                 timeout=SEND_TIMEOUT
             )
         except RetryAfter as e:
             wait_time = getattr(e, 'retry_after', 1)
-            logger.warning(f"Rate limited, waiting {wait_time}s")
             await asyncio.sleep(wait_time)
         except (TimedOut, NetworkError, asyncio.TimeoutError) as e:
-            logger.warning(f"Network error (attempt {attempt}/{SEND_RETRIES}): {e}")
             if attempt < SEND_RETRIES:
-                await asyncio.sleep(1 * attempt)  # زيادة الانتظار تدريجياً
+                await asyncio.sleep(1 * attempt)
             else:
-                logger.error("Failed to send message after retries")
                 return None
         except BadRequest as e:
-            logger.error(f"Bad request: {e}")
-            # لا نعيد المحاولة لأخطاء BadRequest
             return None
         except Exception as e:
-            logger.error(f"Unexpected error in safe_send: {e}")
             if attempt == SEND_RETRIES:
                 return None
             await asyncio.sleep(1)
-    
     return None
 
 async def safe_answer_callback(query, text: str = None, show_alert: bool = False):
-    """إجابة آمنة على callback queries"""
     try:
         await query.answer(text=text, show_alert=show_alert)
     except Exception as e:
-        logger.warning(f"Failed to answer callback: {e}")
+        pass
 
 # =========================
 # Arabic normalization
@@ -281,48 +259,36 @@ def looks_like_real_name(name: str) -> bool:
 # =========================
 # Maintenance guard
 # =========================
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
 async def maintenance_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not MAINTENANCE_ON:
         return False
     
     user_id = update.effective_user.id if update.effective_user else 0
-    if is_admin(user_id):
+    if user_id in ADMIN_IDS:
         return False
     
     msg = "🛠️ البوت تحت صيانة حالياً… ارجعوا بعدين 🌿"
-    
     try:
         if update.message:
             await safe_send(context.bot, update.message.chat_id, msg, reply_markup=ReplyKeyboardRemove())
         elif update.callback_query:
             await safe_answer_callback(update.callback_query, "البوت تحت صيانة", show_alert=True)
             await safe_send(context.bot, update.callback_query.message.chat_id, msg, reply_markup=ReplyKeyboardRemove())
-    except Exception as e:
-        logger.error(f"Maintenance block failed: {e}")
-    
+    except Exception:
+        pass
     return True
 
 # =========================
 # Database operations
 # =========================
 def upsert_user(user_id: int):
-    """إضافة أو تحديث مستخدم مع تحديث وقت النشاط"""
     now = datetime.utcnow().isoformat()
     with db_manager.get_cursor() as cur:
         cur.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
         if cur.fetchone():
-            cur.execute(
-                "UPDATE users SET updated_at=?, last_active=? WHERE user_id=?",
-                (now, now, user_id)
-            )
+            cur.execute("UPDATE users SET updated_at=?, last_active=? WHERE user_id=?", (now, now, user_id))
         else:
-            cur.execute(
-                "INSERT INTO users(user_id, created_at, updated_at, last_active) VALUES (?,?,?,?)",
-                (user_id, now, now, now)
-            )
+            cur.execute("INSERT INTO users(user_id, created_at, updated_at, last_active) VALUES (?,?,?,?)", (user_id, now, now, now))
 
 def set_pending_name(user_id: int, full_name: str):
     now = datetime.utcnow().isoformat()
@@ -343,10 +309,7 @@ def approve_name(user_id: int):
         row = cur.fetchone()
         if row:
             full_name = row["full_name"]
-            cur.execute("""
-                UPDATE users SET full_name=?, is_approved=1, updated_at=?
-                WHERE user_id=?
-            """, (full_name, now, user_id))
+            cur.execute("UPDATE users SET full_name=?, is_approved=1, updated_at=? WHERE user_id=?", (full_name, now, user_id))
             cur.execute("DELETE FROM pending_names WHERE user_id=?", (user_id,))
 
 def reject_name(user_id: int):
@@ -367,10 +330,7 @@ def get_pending_list() -> List[Dict[str, Any]]:
 def mark_seen(user_id: int, qid: str):
     now = datetime.utcnow().isoformat()
     with db_manager.get_cursor() as cur:
-        cur.execute("""
-            INSERT OR IGNORE INTO seen_questions(user_id, qid, seen_at)
-            VALUES(?,?,?)
-        """, (user_id, qid, now))
+        cur.execute("INSERT OR IGNORE INTO seen_questions(user_id, qid, seen_at) VALUES(?,?,?)", (user_id, qid, now))
 
 def has_seen(user_id: int, qid: str) -> bool:
     if not qid:
@@ -400,7 +360,6 @@ def save_round_result(user_id: int, score: int, bonus: int, correct: int, total:
             """, (total_points, rounds_played, best_round_score, now, user_id))
 
 def save_active_round(user_id: int, round_data: Dict[str, Any]):
-    """حفظ جولة نشطة للاسترجاع عند فقدان الاتصال"""
     now = datetime.utcnow().isoformat()
     data_json = json.dumps(round_data, ensure_ascii=False)
     with db_manager.get_cursor() as cur:
@@ -413,7 +372,6 @@ def save_active_round(user_id: int, round_data: Dict[str, Any]):
         """, (user_id, data_json, now, now))
 
 def load_active_round(user_id: int) -> Optional[Dict[str, Any]]:
-    """تحميل جولة نشطة"""
     with db_manager.get_cursor() as cur:
         cur.execute("SELECT data FROM active_rounds WHERE user_id=?", (user_id,))
         row = cur.fetchone()
@@ -422,7 +380,6 @@ def load_active_round(user_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 def delete_active_round(user_id: int):
-    """حذف جولة نشطة"""
     with db_manager.get_cursor() as cur:
         cur.execute("DELETE FROM active_rounds WHERE user_id=?", (user_id,))
 
@@ -441,7 +398,8 @@ def get_leaderboard(top_n: int) -> List[Dict[str, Any]]:
 # Question Manager with caching
 # =========================
 class QuestionManager:
-    def __init__(self):
+    def __init__(self, filename):
+        self.filename = filename
         self.items = []
         self.buckets = {}
         self.term_pool = []
@@ -449,13 +407,16 @@ class QuestionManager:
         self.load_questions()
     
     def load_questions(self):
-        """تحميل الأسئلة مع caching"""
         try:
-            file_mtime = os.path.getmtime(QUESTIONS_FILE)
+            if not os.path.exists(self.filename):
+                logger.warning(f"File not found: {self.filename}")
+                return
+
+            file_mtime = os.path.getmtime(self.filename)
             if self.last_loaded and file_mtime <= self.last_loaded:
                 return
             
-            with open(QUESTIONS_FILE, "r", encoding="utf-8") as f:
+            with open(self.filename, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
             if isinstance(data, list):
@@ -465,20 +426,19 @@ class QuestionManager:
             else:
                 items = []
             
-            # إضافة IDs فريدة إن لم تكن موجودة
             for i, item in enumerate(items):
                 if "id" not in item:
-                    item["id"] = f"q_{i}_{hash(str(item))}"
+                    item["id"] = f"q_{self.filename}_{i}_{hash(str(item))}"
             
             self.items = items
             self.buckets = self.build_chapter_buckets(items)
             self.term_pool = self.extract_terms(items)
             self.last_loaded = file_mtime
             
-            logger.info(f"Loaded {len(items)} questions, {len(self.term_pool)} terms")
+            logger.info(f"Loaded {len(items)} questions from {self.filename}")
             
         except Exception as e:
-            logger.error(f"Failed to load questions: {e}")
+            logger.error(f"Failed to load questions from {self.filename}: {e}")
             self.items = []
             self.buckets = {}
             self.term_pool = []
@@ -497,7 +457,8 @@ class QuestionManager:
             "المخاليط والمحاليل": ["مخلوط", "محلول", "مذيب", "مذاب", "تركيز", "ذائبيه", "حمض", "قاعده", "تعادل", "ترسب", "ph", "ايوني", "تساهمي"],
             "حالات المادة": ["صلب", "سائل", "غاز", "بلازما", "انصهار", "تبخر", "تكاثف", "تجمد", "تسامي", "ضغط", "كثافه", "توتر سطحي", "لزوج"],
             "الطاقة وتحولاتها": ["طاقه", "حركيه", "وضع", "كامنه", "اشعاعيه", "كيميائيه", "كهربائيه", "نوويه", "توربين", "مولد", "خليه شمسيه", "حفظ الطاقه"],
-            "أجهزة الجسم": ["دم", "قلب", "شريان", "وريد", "شعيره", "مناعه", "اجسام مضاده", "مولدات الضد", "ايدز", "سكري", "هضم", "معده", "امعاء", "رئه", "تنفس", "كليه", "بول"],
+            "أجهزة الجسم": ["دم", "قلب", "شريان", "وريد", "شعيره", "مناعه", "اجسام مضاده", "مولدات الضد", "ايدز", "سكري", "هضم", "معده", "امعاء", "رئه", "تنفس", "كليه", "بول", "عظام", "مفصل", "جلد", "بشره"],
+            "النباتات": ["لحاء", "خشب", "بذور", "ثغور", "مخاريط", "سرخسيات", "حزازيات"]
         }
         
         blob = ""
@@ -527,7 +488,6 @@ class QuestionManager:
         return best_chapter
     
     def extract_terms(self, items: List[Dict[str, Any]]) -> List[str]:
-        """استخراج جميع المصطلحات"""
         terms = []
         for item in items:
             if item.get("type") == "term":
@@ -537,8 +497,7 @@ class QuestionManager:
         return list(set(terms))
     
     def pick_round_questions(self, user_id: int) -> List[Dict[str, Any]]:
-        """اختيار أسئلة الجولة مع تجنب التكرار"""
-        self.load_questions()  # تحديث إذا لزم الأمر
+        self.load_questions()
         
         if not self.buckets:
             return []
@@ -547,7 +506,6 @@ class QuestionManager:
         chosen = []
         seen_ids = set()
         
-        # محاولة الحصول على أسئلة غير مشاهدة لكل فصل
         for chapter in CHAPTERS:
             pool = self.buckets.get(chapter, [])
             unseen = [q for q in pool if not has_seen(user_id, q.get("id"))]
@@ -559,7 +517,6 @@ class QuestionManager:
                     chosen.append(q)
                     seen_ids.add(q["id"])
         
-        # إذا لم نحصل على عدد كافٍ، نأتي بأسئلة إضافية
         if len(chosen) < ROUND_SIZE:
             all_questions = []
             for chapter in CHAPTERS:
@@ -573,29 +530,23 @@ class QuestionManager:
                     if len(chosen) >= ROUND_SIZE:
                         break
         
-        # ضمان عدم تجاوز العدد المطلوب
         chosen = chosen[:ROUND_SIZE]
         random.shuffle(chosen)
         return chosen
     
     def convert_term_to_mcq(self, term_question: Dict[str, Any]) -> Dict[str, Any]:
-        """تحويل سؤال المصطلح إلى MCQ"""
         correct_term = term_question.get("term", "").strip()
         definition = term_question.get("definition", "").strip()
         
-        # اختيار 3 مصطلحات خاطئة عشوائية
         wrong_terms = [t for t in self.term_pool if t != correct_term]
         if len(wrong_terms) >= 3:
             distractors = random.sample(wrong_terms, 3)
         else:
-            # fallback: إنشاء مصطلحات وهمية إذا لم يكن هناك ما يكفي
             distractors = ["مصطلح 1", "مصطلح 2", "مصطلح 3"]
         
-        # خلط الخيارات
         all_choices = [correct_term] + distractors
         random.shuffle(all_choices)
         
-        # إنشاء خيارات
         options = {}
         correct_key = None
         for i, choice in enumerate(all_choices):
@@ -604,34 +555,31 @@ class QuestionManager:
             if choice == correct_term:
                 correct_key = key
         
-        # إنشاء سؤال MCQ جديد
         mcq_question = term_question.copy()
         mcq_question.update({
             "type": "mcq",
             "question": f"ما هو المصطلح المناسب للتعريف التالي؟\n\n{definition}",
             "options": options,
             "correct": correct_key,
-            "original_type": "term"  # للإشارة إلى أن هذا تم تحويله
+            "original_type": "term"
         })
         
         return mcq_question
 
-question_manager = QuestionManager()
+qm_term1 = QuestionManager(TERM1_FILE)
+qm_term2 = QuestionManager(TERM2_FILE)
 
 # =========================
 # Session Cleanup Task
 # =========================
 async def cleanup_task():
-    """مهمة تنظيف الجلسات القديمة"""
     while True:
         try:
             await asyncio.sleep(CLEANUP_INTERVAL)
-            
             cutoff = datetime.utcnow() - timedelta(seconds=MAX_ROUND_DURATION)
             cutoff_str = cutoff.isoformat()
             
             with db_manager.get_cursor() as cur:
-                # تنظيف الجولات النشطة القديمة
                 cur.execute("""
                     SELECT user_id, data FROM active_rounds 
                     WHERE last_activity < ?
@@ -646,25 +594,11 @@ async def cleanup_task():
                         correct = data.get("round_correct", 0)
                         total = data.get("total_questions", ROUND_SIZE)
                         
-                        # حفظ النتيجة كجولة منتهية
-                        save_round_result(
-                            row["user_id"], 
-                            score, 
-                            bonus, 
-                            correct, 
-                            total,
-                            "timeout"
-                        )
-                        
-                        logger.info(f"Cleaned up old round for user {row['user_id']}")
+                        save_round_result(row["user_id"], score, bonus, correct, total, "timeout")
                     except Exception as e:
                         logger.error(f"Error cleaning round: {e}")
                 
-                # حذف الجولات النشطة القديمة
                 cur.execute("DELETE FROM active_rounds WHERE last_activity < ?", (cutoff_str,))
-            
-            logger.info("Cleanup task completed")
-            
         except Exception as e:
             logger.error(f"Cleanup task error: {e}")
             await asyncio.sleep(60)
@@ -688,9 +622,9 @@ def main_menu_keyboard(user: Dict[str, Any]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🏆 لوحة التميز (Top 10)", callback_data="leaderboard")],
         [InlineKeyboardButton("📊 إحصائياتي", callback_data="my_stats")],
         [InlineKeyboardButton(name_status, callback_data="set_name")],
+        [InlineKeyboardButton("💬 تواصل مع المشرف", callback_data="contact_admin")], # الزر الجديد هنا
     ]
     
-    # إضافة زر استعادة الجولة النشطة إذا كانت موجودة
     if user.get("user_id"):
         active_round = load_active_round(user["user_id"])
         if active_round:
@@ -698,12 +632,19 @@ def main_menu_keyboard(user: Dict[str, Any]) -> InlineKeyboardMarkup:
     
     return InlineKeyboardMarkup(kb)
 
+def term_selection_keyboard() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("📚 الفصل الدراسي الأول", callback_data="start_term1")],
+        [InlineKeyboardButton("📘 الفصل الدراسي الثاني", callback_data="start_term2")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
 def answer_keyboard_mcq(options: Dict[str, str]) -> InlineKeyboardMarkup:
     rows = []
     for key in ["A", "B", "C", "D"]:
         if key in options:
             text = options[key]
-            # قص النص الطويل
             if len(text) > 40:
                 text = text[:37] + "..."
             rows.append([InlineKeyboardButton(f"{key}) {text}", callback_data=f"ans_mcq:{key}")])
@@ -750,29 +691,12 @@ def parse_tf_answer(raw: Any) -> Optional[bool]:
 # =========================
 # Motivation phrases
 # =========================
-MOTIVATION_CORRECT = [
-    "🔥 بطل! كمل كذا!",
-    "👏 ممتاز!",
-    "💪 رهيب!",
-    "✅ صح عليك!",
-    "🌟 كفو!",
-    "🚀 يا سلام عليك!",
-]
-MOTIVATION_WRONG = [
-    "😅 بسيطة! الجاية صح إن شاء الله.",
-    "👀 ركّز شوي، تقدر!",
-    "💡 مو مشكلة، تعلمنا!",
-    "🔥 لا توقف! كمل!",
-    "😎 قدها وقدود!",
-]
-MOTIVATION_BONUS = [
-    "🏅 بونص! سلسلة نار 🔥",
-    "🎯 ممتاز! خذت بونص!",
-    "💥 كملت سلسلة الصح!",
-]
+MOTIVATION_CORRECT = ["🔥 بطل! كمل كذا!", "👏 ممتاز!", "💪 رهيب!", "✅ صح عليك!", "🌟 كفو!", "🚀 يا سلام عليك!"]
+MOTIVATION_WRONG = ["😅 بسيطة! الجاية صح إن شاء الله.", "👀 ركّز شوي، تقدر!", "💡 مو مشكلة، تعلمنا!", "🔥 لا توقف! كمل!", "😎 قدها وقدود!"]
+MOTIVATION_BONUS = ["🏅 بونص! سلسلة نار 🔥", "🎯 ممتاز! خذت بونص!", "💥 كملت سلسلة الصح!"]
 
 # =========================
-# Handlers - محسنة للأداء والثبات
+# Handlers
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await maintenance_block(update, context):
@@ -781,9 +705,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     upsert_user(user_id)
     user = get_user(user_id)
-    
-    # إضافة user_id للسجلات
-    logger.info(f"User {user_id} started bot")
     
     msg = (
         "هلا 👋\n"
@@ -809,10 +730,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     data = query.data
     
-    logger.info(f"Menu callback: {data} from user {user_id}")
-    
     if data == "set_name":
         context.user_data["awaiting_name"] = True
+        context.user_data["awaiting_contact"] = False
         await query.message.reply_text(
             "اكتب اسمك الحقيقي (عربي فقط) مثل: **محمد أحمد**\n"
             "شروطنا:\n"
@@ -824,22 +744,24 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove()
         )
         return
+        
+    if data == "contact_admin":
+        context.user_data["awaiting_contact"] = True
+        context.user_data["awaiting_name"] = False
+        await query.message.reply_text(
+            "📝 اكتب رسالتك أو استفسارك الآن، وراح توصل للمشرف مباشرة:",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return
     
     if data == "resume_round":
         active_round = load_active_round(user_id)
         if active_round:
             context.user_data.update(active_round)
-            await query.message.reply_text(
-                "🔄 **تم استعادة جولتك النشطة**\n"
-                "استمر من حيث توقفت!",
-                reply_markup=ReplyKeyboardRemove()
-            )
+            await query.message.reply_text("🔄 **تم استعادة جولتك النشطة**\nاستمر من حيث توقفت!", reply_markup=ReplyKeyboardRemove())
             await send_next_question(query.message.chat_id, user_id, context)
         else:
-            await query.message.reply_text(
-                "❌ لا توجد جولة نشطة للاستعادة",
-                reply_markup=ReplyKeyboardRemove()
-            )
+            await query.message.reply_text("❌ لا توجد جولة نشطة للاستعادة", reply_markup=ReplyKeyboardRemove())
         return
     
     if data == "leaderboard":
@@ -849,9 +771,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines = ["🏆 **لوحة التميز (Top 10)**\n"]
             for i, row in enumerate(lb, start=1):
-                lines.append(
-                    f"{i}) {row['full_name']} — ⭐️ {row['total_points']} نقطة (أفضل جولة: {row['best_round_score']})"
-                )
+                lines.append(f"{i}) {row['full_name']} — ⭐️ {row['total_points']} نقطة (أفضل جولة: {row['best_round_score']})")
             text = "\n".join(lines)
         
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
@@ -864,57 +784,49 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = user.get("total_points", 0)
         rounds = user.get("rounds_played", 0)
         best = user.get("best_round_score", 0)
-        text = (
-            f"📊 **إحصائياتك**\n"
-            f"الاسم: {name} {approved}\n"
-            f"النقاط: ⭐️ {total}\n"
-            f"عدد الجولات: 🎮 {rounds}\n"
-            f"أفضل جولة: 🥇 {best}\n"
-        )
+        text = (f"📊 **إحصائياتك**\nالاسم: {name} {approved}\nالنقاط: ⭐️ {total}\nعدد الجولات: 🎮 {rounds}\nأفضل جولة: 🥇 {best}\n")
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
         await query.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
         return
     
     if data == "play_round":
-        # التحقق من وجود جولة نشطة
         active_round = load_active_round(user_id)
         if active_round:
             await query.message.reply_text(
-                "⚠️ **لديك جولة نشطة بالفعل**\n\n"
-                "يمكنك:\n"
-                "• استكمال الجولة من الزر 'استعادة الجولة النشطة'\n"
-                "• أو إنهاء الجولة الحالية أولاً",
+                "⚠️ **لديك جولة نشطة بالفعل**\n\nيمكنك:\n• استكمال الجولة من الزر 'استعادة الجولة النشطة'\n• أو إنهاء الجولة الحالية أولاً",
                 reply_markup=ReplyKeyboardRemove()
             )
             return
         
-        await start_round(query, context)
+        await query.message.reply_text("اختر الفصل الدراسي للبدء 🎯:", reply_markup=term_selection_keyboard())
         return
 
-async def start_round(query, context: ContextTypes.DEFAULT_TYPE):
+    if data in ("start_term1", "start_term2"):
+        await start_round(query, context, data)
+        return
+
+    if data == "back_to_main":
+        await query.message.reply_text("القائمة:", reply_markup=main_menu_keyboard(user))
+        return
+
+async def start_round(query, context: ContextTypes.DEFAULT_TYPE, term: str):
     user_id = query.from_user.id
     upsert_user(user_id)
     
-    # جلب الأسئلة
-    round_questions = question_manager.pick_round_questions(user_id)
+    qm = qm_term1 if term == "start_term1" else qm_term2
+    round_questions = qm.pick_round_questions(user_id)
     
-    if len(round_questions) < 10:  # على الأقل 10 أسئلة للبدء
-        await query.message.reply_text(
-            "❌ **لا توجد أسئلة كافية للبدء**\n"
-            "يرجى إضافة المزيد من الأسئلة إلى الملف",
-            reply_markup=ReplyKeyboardRemove()
-        )
+    if len(round_questions) < 10:
+        await query.message.reply_text("❌ **لا توجد أسئلة كافية للبدء في هذا الفصل**", reply_markup=ReplyKeyboardRemove())
         return
     
-    # تحويل أسئلة المصطلحات إلى MCQ
     processed_questions = []
     for q in round_questions:
         if q.get("type") == "term":
-            processed_questions.append(question_manager.convert_term_to_mcq(q))
+            processed_questions.append(qm.convert_term_to_mcq(q))
         else:
             processed_questions.append(q)
     
-    # إعداد بيانات الجولة
     round_data = {
         "round_questions": processed_questions,
         "round_index": 0,
@@ -930,12 +842,11 @@ async def start_round(query, context: ContextTypes.DEFAULT_TYPE):
     }
     
     context.user_data.update(round_data)
-    
-    # حفظ الجولة النشطة
     save_active_round(user_id, round_data)
     
+    term_name = "الفصل الدراسي الأول" if term == "start_term1" else "الفصل الدراسي الثاني"
     await query.message.reply_text(
-        f"🎮 **بدأت الجولة!**\n\n"
+        f"🎮 **بدأت الجولة! ({term_name})**\n\n"
         f"عدد الأسئلة: {len(processed_questions)}\n"
         f"جاهز؟ 🔥",
         reply_markup=ReplyKeyboardRemove()
@@ -944,13 +855,10 @@ async def start_round(query, context: ContextTypes.DEFAULT_TYPE):
     await send_next_question(query.message.chat_id, user_id, context)
 
 async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """إرسال السؤال التالي مع تحديث وقت النشاط"""
     try:
-        # تحديث وقت النشاط
         now = datetime.utcnow().isoformat()
         context.user_data["last_activity"] = now
         
-        # تحديث الجولة النشطة في قاعدة البيانات
         round_data = {
             k: v for k, v in context.user_data.items() 
             if k.startswith("round_") or k in ["total_questions", "start_time", "last_activity"]
@@ -986,8 +894,6 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
             await safe_send(context.bot, chat_id, text, reply_markup=answer_keyboard_tf())
             return
         
-        # لا توجد أسئلة term بعد الآن - جميعها تم تحويلها لـ MCQ
-        
         await safe_send(context.bot, chat_id, "⚠️ نوع سؤال غير معروف… تخطيناه.", reply_markup=ReplyKeyboardRemove())
         context.user_data["round_index"] = idx + 1
         await send_next_question(chat_id, user_id, context)
@@ -1006,18 +912,12 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     chat_id = query.message.chat_id
     
-    # التحقق من وجود جولة نشطة
     if "round_questions" not in context.user_data:
         active_round = load_active_round(user_id)
         if active_round:
             context.user_data.update(active_round)
         else:
-            await query.message.reply_text(
-                "❌ **لا توجد جولة نشطة**\n\n"
-                "ابدأ جولة جديدة من القائمة 👇\n"
-                "اكتب /start للعودة",
-                reply_markup=ReplyKeyboardRemove()
-            )
+            await query.message.reply_text("❌ **لا توجد جولة نشطة**\nاكتب /start للعودة", reply_markup=ReplyKeyboardRemove())
             return
     
     q = context.user_data.get("current_q")
@@ -1055,7 +955,6 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await apply_answer_result(chat_id, user_id, context, is_correct)
 
 async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, is_correct: bool):
-    """معالجة نتيجة الإجابة مع تحديث الجولة النشطة"""
     try:
         idx = context.user_data.get("round_index", 0)
         q = context.user_data.get("current_q") or {}
@@ -1077,8 +976,6 @@ async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.
             await safe_send(context.bot, chat_id, msg, reply_markup=ReplyKeyboardRemove())
         else:
             context.user_data["round_streak"] = 0
-            
-            # عرض الإجابة الصحيحة
             correct_text = "—"
             t = q.get("type")
             
@@ -1093,15 +990,12 @@ async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.
             msg = f"❌ خطأ! {random.choice(MOTIVATION_WRONG)}\n\n✅ الإجابة الصحيحة كانت: **{correct_text}**"
             await safe_send(context.bot, chat_id, msg, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
         
-        # تسجيل السؤال كمشاهد
         qid = q.get("id", "")
         if qid:
             mark_seen(user_id, qid)
         
-        # الانتقال للسؤال التالي
         context.user_data["round_index"] = idx + 1
         
-        # تحديث الجولة النشطة
         round_data = {
             k: v for k, v in context.user_data.items() 
             if k.startswith("round_") or k in ["total_questions", "start_time", "last_activity"]
@@ -1109,7 +1003,6 @@ async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.
         round_data["last_activity"] = datetime.utcnow().isoformat()
         save_active_round(user_id, round_data)
         
-        # تأخير قصير قبل السؤال التالي
         await asyncio.sleep(0.5)
         await send_next_question(chat_id, user_id, context)
         
@@ -1118,19 +1011,14 @@ async def apply_answer_result(chat_id: int, user_id: int, context: ContextTypes.
         await safe_send(context.bot, chat_id, "⚠️ حدث خطأ في معالجة إجابتك. حاول مرة أخرى.", reply_markup=ReplyKeyboardRemove())
 
 async def finish_round(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, ended_by_user: bool):
-    """إنهاء الجولة وحفظ النتائج"""
     try:
         user = get_user(user_id)
-        
         score = int(context.user_data.get("round_score", 0))
         bonus = int(context.user_data.get("round_bonus", 0))
         correct = int(context.user_data.get("round_correct", 0))
         total = int(context.user_data.get("total_questions", ROUND_SIZE))
         
-        # حفظ النتيجة
         save_round_result(user_id, score, bonus, correct, total)
-        
-        # حذف الجولة النشطة
         delete_active_round(user_id)
         
         chap_correct = context.user_data.get("round_chapter_correct", {})
@@ -1155,43 +1043,24 @@ async def finish_round(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
             lines.append("")
             lines.append("ℹ️ تقدر تجمع نقاط، بس لوحة التميز تظهر بعد اعتماد اسمك ✅")
         
-        await safe_send(
-            context.bot,
-            chat_id,
-            "\n".join(lines),
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
-        )
+        await safe_send(context.bot, chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
         
     except Exception as e:
         logger.error(f"Error in finish_round: {e}")
-        await safe_send(
-            context.bot,
-            chat_id,
-            "⚠️ حدث خطأ في إنهاء الجولة، لكن النقاط تم حفظها.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+        await safe_send(context.bot, chat_id, "⚠️ حدث خطأ في إنهاء الجولة، لكن النقاط تم حفظها.", reply_markup=ReplyKeyboardRemove())
     finally:
-        # تنظيف بيانات الجولة من context.user_data
         keys_to_remove = [
             "round_questions", "round_index", "round_score", "round_bonus",
             "round_correct", "round_streak", "round_chapter_correct",
             "round_chapter_total", "current_q", "total_questions",
             "start_time", "last_activity"
         ]
-        
         for key in keys_to_remove:
             context.user_data.pop(key, None)
         
-        # العودة للقائمة الرئيسية
         upsert_user(user_id)
         user = get_user(user_id)
-        await safe_send(
-            context.bot,
-            chat_id,
-            "اختر من القائمة 👇",
-            reply_markup=main_menu_keyboard(user)
-        )
+        await safe_send(context.bot, chat_id, "اختر من القائمة 👇", reply_markup=main_menu_keyboard(user))
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await maintenance_block(update, context):
@@ -1201,50 +1070,46 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user_id = update.effective_user.id
-    chat_id = update.message.chat_id
     text = update.message.text.strip()
     
-    # تسجيل الاسم
+    # معالجة استلام رسالة التواصل مع الإدارة
+    if context.user_data.get("awaiting_contact"):
+        context.user_data["awaiting_contact"] = False
+        user = get_user(user_id)
+        name = user.get("full_name") or update.effective_user.full_name or "بدون اسم"
+        
+        await update.message.reply_text("✅ تم إرسال رسالتك للمشرف بنجاح. شكراً لتواصلك معنا!", reply_markup=ReplyKeyboardRemove())
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                await safe_send(context.bot, admin_id, f"📩 **رسالة جديدة من مستخدم:**\n\n👤 المستخدم: {name} (ID: {user_id})\n📝 الرسالة:\n{text}", parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Failed to send contact message to admin: {e}")
+        
+        # العودة للقائمة
+        await safe_send(context.bot, update.message.chat_id, "القائمة:", reply_markup=main_menu_keyboard(user))
+        return
+
+    # معالجة استلام تسجيل الاسم
     if context.user_data.get("awaiting_name"):
         if not looks_like_real_name(text):
-            await update.message.reply_text(
-                "❌ الاسم ما ينفع حسب الشروط.\n"
-                "اكتبه عربي فقط وبكلمتين على الأقل وبشكل محترم.\n"
-                "جرّب مرة ثانية 👇",
-                reply_markup=ReplyKeyboardRemove()
-            )
+            await update.message.reply_text("❌ الاسم ما ينفع حسب الشروط.\nجرّب مرة ثانية 👇", reply_markup=ReplyKeyboardRemove())
             return
         
         upsert_user(user_id)
         set_pending_name(user_id, text)
         context.user_data["awaiting_name"] = False
         
-        await update.message.reply_text(
-            "✅ تم استلام الاسم.\n"
-            "صار بانتظار موافقة الأدمن 👑\n"
-            "تقدر تلعب الحين، بس لوحة التميز ما تظهر إلا بعد الاعتماد.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+        await update.message.reply_text("✅ تم استلام الاسم. بانتظار موافقة الأدمن 👑", reply_markup=ReplyKeyboardRemove())
         
-        # إشعار المشرفين
         for admin_id in ADMIN_IDS:
             try:
-                await safe_send(
-                    context.bot,
-                    admin_id,
-                    f"📝 طلب اعتماد اسم:\n• المستخدم: {user_id}\n• الاسم: {text}",
-                    reply_markup=admin_pending_keyboard(user_id)
-                )
-            except Exception as e:
-                logger.warning(f"Failed to notify admin {admin_id}: {e}")
+                await safe_send(context.bot, admin_id, f"📝 طلب اعتماد اسم:\n• المستخدم: {user_id}\n• الاسم: {text}", reply_markup=admin_pending_keyboard(user_id))
+            except Exception:
+                pass
         return
     
-    # لا توجد معالجة نصوص أخرى - جميع الأسئلة الآن اختيارية
-    await update.message.reply_text(
-        "استخدم القائمة للتنقل بين الخيارات 👇\n"
-        "اكتب /start للعودة إلى القائمة الرئيسية",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await update.message.reply_text("استخدم القائمة للتنقل 👇\nاكتب /start للعودة", reply_markup=ReplyKeyboardRemove())
 
 # =========================
 # Admin Handlers
@@ -1254,15 +1119,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
         return
-    
     pending = get_pending_list()
-    await update.message.reply_text(
-        f"👑 لوحة الأدمن\n"
-        f"• الصيانة: {'✅ شغالة' if MAINTENANCE_ON else '❌ مطفية'}\n"
-        f"• طلبات الأسماء المعلّقة: {len(pending)}\n\n"
-        f"استخدم /pending لعرض الطلبات.",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await update.message.reply_text(f"👑 لوحة الأدمن\nطلبات الأسماء المعلّقة: {len(pending)}\nاستخدم /pending لعرض الطلبات.", reply_markup=ReplyKeyboardRemove())
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1279,22 +1137,20 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = int(data.split(":")[1])
         approve_name(uid)
         await query.message.reply_text(f"✅ تم اعتماد المستخدم {uid}", reply_markup=ReplyKeyboardRemove())
-        
         try:
             await safe_send(context.bot, uid, "🎉 تم اعتماد اسمك! الحين بتدخل لوحة التميز 🏆", reply_markup=ReplyKeyboardRemove())
-        except Exception as e:
-            logger.warning(f"Failed to notify user {uid}: {e}")
+        except Exception:
+            pass
         return
     
     if data.startswith("admin_reject:"):
         uid = int(data.split(":")[1])
         reject_name(uid)
         await query.message.reply_text(f"❌ تم رفض الاسم للمستخدم {uid}", reply_markup=ReplyKeyboardRemove())
-        
         try:
-            await safe_send(context.bot, uid, "❌ اسمك ما تم اعتماده. اكتب اسمك مرة ثانية بشكل واضح ومحترم.", reply_markup=ReplyKeyboardRemove())
-        except Exception as e:
-            logger.warning(f"Failed to notify user {uid}: {e}")
+            await safe_send(context.bot, uid, "❌ اسمك ما تم اعتماده. اكتب اسمك مرة ثانية بشكل محترم.", reply_markup=ReplyKeyboardRemove())
+        except Exception:
+            pass
         return
 
 async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1302,42 +1158,28 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
         return
-    
     pending = get_pending_list()
     if not pending:
         await update.message.reply_text("ما فيه طلبات معلّقة ✅", reply_markup=ReplyKeyboardRemove())
         return
-    
     for p in pending[:20]:
-        uid = int(p["user_id"])
-        nm = p["full_name"]
-        await update.message.reply_text(
-            f"📝 طلب معلّق:\n• المستخدم: {uid}\n• الاسم: {nm}",
-            reply_markup=admin_pending_keyboard(uid)
-        )
+        await update.message.reply_text(f"📝 طلب معلّق:\n• المستخدم: {p['user_id']}\n• الاسم: {p['full_name']}", reply_markup=admin_pending_keyboard(p['user_id']))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "الأوامر:\n"
-        "/start — تشغيل البوت\n"
-        "/admin — للأدمن\n"
-        "/pending — للأدمن: عرض طلبات الأسماء\n"
-        "/help — مساعدة\n"
-    )
-    await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("الأوامر:\n/start — تشغيل البوت\n/admin — للأدمن\n/pending — طلبات الأسماء\n/reload — تحديث الأسئلة", reply_markup=ReplyKeyboardRemove())
 
 async def reload_questions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إعادة تحميل الأسئلة من الملف"""
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("❌ الأمر هذا للأدمن فقط.", reply_markup=ReplyKeyboardRemove())
         return
     
-    question_manager.load_questions()
+    qm_term1.load_questions()
+    qm_term2.load_questions()
     await update.message.reply_text(
-        f"✅ تم إعادة تحميل الأسئلة\n"
-        f"• عدد الأسئلة: {len(question_manager.items)}\n"
-        f"• عدد المصطلحات: {len(question_manager.term_pool)}",
+        f"✅ تم إعادة تحميل الأسئلة للملفين\n"
+        f"• أسئلة الفصل الأول: {len(qm_term1.items)}\n"
+        f"• أسئلة الفصل الثاني: {len(qm_term2.items)}",
         reply_markup=ReplyKeyboardRemove()
     )
 
@@ -1345,121 +1187,58 @@ async def reload_questions_command(update: Update, context: ContextTypes.DEFAULT
 # Global error handler
 # =========================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """معالج الأخطاء العام"""
     logger.error("Exception while handling an update:", exc_info=context.error)
-    
-    # إذا كان هناك تحديث، نرسل رسالة خطأ للمستخدم
     if isinstance(update, Update):
         try:
             if update.message:
-                chat_id = update.message.chat_id
-                await safe_send(
-                    context.bot,
-                    chat_id,
-                    "⚠️ حدث خطأ غير متوقع. الرجاء المحاولة مرة أخرى.",
-                    reply_markup=ReplyKeyboardRemove()
-                )
+                await safe_send(context.bot, update.message.chat_id, "⚠️ حدث خطأ غير متوقع.", reply_markup=ReplyKeyboardRemove())
             elif update.callback_query:
-                await safe_answer_callback(
-                    update.callback_query,
-                    "حدث خطأ غير متوقع",
-                    show_alert=True
-                )
-        except Exception as e:
-            logger.error(f"Error in error handler: {e}")
+                await safe_answer_callback(update.callback_query, "حدث خطأ غير متوقع", show_alert=True)
+        except Exception:
+            pass
 
 # =========================
-# Main - بدون job_queue
+# Main
 # =========================
 def main():
-    """الدالة الرئيسية لتشغيل البوت"""
+    qm_term1.load_questions()
+    qm_term2.load_questions()
     
-    # تحميل الأسئلة أولاً
-    question_manager.load_questions()
+    logger.info(f"Loaded {len(qm_term1.items)} for Term 1, and {len(qm_term2.items)} for Term 2.")
     
-    if not question_manager.items:
-        logger.error("No questions loaded! Check questions_from_word.json")
-        print("❌ لم يتم تحميل أي أسئلة! تحقق من ملف questions_from_word.json")
-        return
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
+    app = Application.builder().token(BOT_TOKEN).request(request).concurrent_updates(True).build()
     
-    logger.info(f"Loaded {len(question_manager.items)} questions")
-    logger.info(f"Admins: {sorted(list(ADMIN_IDS))}")
-    logger.info(f"Maintenance mode: {MAINTENANCE_ON}")
-    
-    # إعداد request مع timeouts محسنة
-    request = HTTPXRequest(
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        pool_timeout=30.0,
-    )
-    
-    # إنشاء التطبيق
-    app = Application.builder() \
-        .token(BOT_TOKEN) \
-        .request(request) \
-        .concurrent_updates(True) \
-        .build()
-    
-    # إضافة handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("pending", pending_command))
     app.add_handler(CommandHandler("reload", reload_questions_command))
     
-    # Callback handlers
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
     app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^(ans_mcq:|ans_tf:|end_round)"))
     app.add_handler(CallbackQueryHandler(menu_callback))
-    
-    # Text handler
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
-    
-    # Error handler
     app.add_error_handler(error_handler)
     
-    # بدء مهمة التنظيف في thread منفصل
     def start_cleanup_thread():
-        """بدء مهمة التنظيف في thread منفصل"""
         try:
-            # إنشاء loop جديد
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            
-            # تشغيل مهمة التنظيف
             cleanup_coro = cleanup_task()
-            
-            # إذا كان هناك حدث loop بالفعل، استخدمه
             try:
                 loop.run_until_complete(cleanup_coro)
             except RuntimeError:
-                # إذا كان هناك loop نشط بالفعل، أنشئ task جديد
                 asyncio.create_task(cleanup_coro)
         except Exception as e:
             logger.error(f"Failed to start cleanup thread: {e}")
     
-    # استيراد threading لتشغيل التنظيف في thread منفصل
     import threading
+    threading.Thread(target=start_cleanup_thread, daemon=True).start()
     
-    # بدء thread التنظيف
-    cleanup_thread = threading.Thread(target=start_cleanup_thread, daemon=True)
-    cleanup_thread.start()
-    
-    logger.info("Cleanup thread started")
-    
-    # تشغيل البوت
     logger.info("Starting bot...")
-    
     try:
-        app.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-            poll_interval=0.5,
-            close_loop=False
-        )
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, poll_interval=0.5, close_loop=False)
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
         raise

@@ -622,7 +622,7 @@ def main_menu_keyboard(user: Dict[str, Any]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🏆 لوحة التميز (Top 10)", callback_data="leaderboard")],
         [InlineKeyboardButton("📊 إحصائياتي", callback_data="my_stats")],
         [InlineKeyboardButton(name_status, callback_data="set_name")],
-        [InlineKeyboardButton("💬 تواصل مع المشرف", callback_data="contact_admin")], # الزر الجديد هنا
+        [InlineKeyboardButton("💬 تواصل مع المشرف", callback_data="contact_admin")],
     ]
     
     if user.get("user_id"):
@@ -1071,8 +1071,23 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_id = update.effective_user.id
     text = update.message.text.strip()
-    
-    # معالجة استلام رسالة التواصل مع الإدارة
+
+    # == ميزة رد المشرف على رسالة الطالب ==
+    if is_admin(user_id) and update.message.reply_to_message:
+        reply_text = update.message.reply_to_message.text
+        # استخراج الآيدي الخاص بالطالب من رسالة البوت السابقة
+        match = re.search(r"\(ID:\s*(\d+)\)", reply_text)
+        if match:
+            target_user_id = int(match.group(1))
+            try:
+                await safe_send(context.bot, target_user_id, f"👨‍🏫 **رد من المشرف:**\n\n{text}")
+                await update.message.reply_text("✅ تم إرسال ردك للطالب بنجاح.")
+            except Exception as e:
+                logger.error(f"Failed to send admin reply: {e}")
+                await update.message.reply_text("❌ فشل إرسال الرد للطالب. قد يكون الطالب قام بحظر البوت.")
+            return
+
+    # معالجة رسالة التواصل مع المشرف
     if context.user_data.get("awaiting_contact"):
         context.user_data["awaiting_contact"] = False
         user = get_user(user_id)
@@ -1086,11 +1101,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Failed to send contact message to admin: {e}")
         
-        # العودة للقائمة
         await safe_send(context.bot, update.message.chat_id, "القائمة:", reply_markup=main_menu_keyboard(user))
         return
 
-    # معالجة استلام تسجيل الاسم
+    # معالجة طلب تسجيل الاسم
     if context.user_data.get("awaiting_name"):
         if not looks_like_real_name(text):
             await update.message.reply_text("❌ الاسم ما ينفع حسب الشروط.\nجرّب مرة ثانية 👇", reply_markup=ReplyKeyboardRemove())
